@@ -30,9 +30,6 @@ dependencies = [
     "fal",
 ]
 
-[tool.setuptools]
-packages = ["streaming_pipeline"]
-
 
 [tool.fal.apps]
 "realtime-streaming" = { auth = "private", ref = "streaming_pipeline/app.py::RealtimeStreamingApp" }

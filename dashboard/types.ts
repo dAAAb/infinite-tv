@@ -1,7 +1,7 @@
 // Shared types for the FAL Realtime Dashboard
 
 // Model types
-export type ModelType = 'ltxv1' | 'ltxv2-preview'
+export type ModelType = 'ltxv1' | 'ltx-2.3' | 'ltx-2.3-local'
 
 // Component-specific metrics types
 export interface RTMPMetrics {
@@ -95,15 +95,14 @@ export interface GenerationHistoryProps {
   generationHistory?: GenerationParams[]
 }
 
-// LTXv2 Preview configuration types
+// LTX 2.3 configuration types
 export interface LTXv2Config {
-  model: 'ltxv2-preview'
+  model: 'ltx-2.3'
   image_url: string
   prompt: string
-  duration?: 6 | 8
-  resolution?: '720p' | '1080p' | '1440p'
-  aspect_ratio?: '9:16' | '16:9'
-  enable_prompt_expansion?: boolean
+  duration?: 6 | 8 | 10 | 12 | 14 | 16 | 18 | 20
+  resolution?: '1080p' | '1440p' | '2160p'
+  aspect_ratio?: 'auto' | '16:9' | '9:16'
   // Streaming parameters (applied after generation)
   target_fps?: number
   width?: number
@@ -126,4 +125,17 @@ export interface LTXv1Config {
   mode: 'regular' | 'nightmare'
 }
 
-export type TestConfig = LTXv1Config | LTXv2Config
+// LTX 2.3 Local configuration types
+export interface LTX23LocalConfig {
+  model: 'ltx-2.3-local'
+  initial_prompt: string
+  initial_image_url: string
+  negative_prompt: string
+  height: number
+  width: number
+  num_frames: number
+  target_fps: number
+  mode: 'regular' | 'nightmare'
+}
+
+export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig

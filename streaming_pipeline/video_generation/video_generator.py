@@ -16,6 +16,10 @@ def safe_snapshot_download(
 ):
     from huggingface_hub import snapshot_download
 
+    # max_workers parallelizes the download itself; recommended by fal:
+    # https://docs.fal.ai/serverless/code/your-code-data-weights
+    kwargs.setdefault("max_workers", 32)
+
     try:
         print("Loading local repo...")
         repo_path = snapshot_download(
@@ -35,17 +39,42 @@ def safe_snapshot_download(
     return repo_path
 
 
+def preload_files(directory: str, parallelism: int = 32) -> None:
+    """Pre-read every file under `directory` in parallel into the OS page cache.
+
+    fal's /data is a distributed filesystem; sequential reads (which is what
+    diffusers' from_pretrained does by default) underutilize it badly. Firing
+    N parallel `cat`s warms the page cache so the subsequent from_pretrained
+    reads from RAM instead of the network.
+    See: https://docs.fal.ai/documentation/serverless/optimizations/parallel-file-loading
+    """
+    import subprocess
+    print(f"📦 Pre-reading {directory} with parallelism={parallelism}...")
+    subprocess.check_call(
+        f"find '{directory}' -type f | xargs -P {parallelism} -I {{}} cat {{}} > /dev/null",
+        shell=True,
+    )
+    print("📦 Pre-read complete.")
+
+
 MODEL_ID = "Lightricks/LTX-Video-0.9.8-13B-distilled"
-REVISION = "main"  # pin to a specific tag/commit for stability
-WEIGHTS_DIR = "/data/models/ltx-video-0.9.8-13b"  # persistent on fal
+REVISION = "main"
+WEIGHTS_DIR = "/data/models/ltx-video-0.9.8-13b"
+
+LTX23_MODEL_ID = "dg845/LTX-2.3-Distilled-Diffusers"
+LTX23_REVISION = "main"
+LTX23_WEIGHTS_DIR = "/data/models/ltx-2.3-distilled-v2"
 
 
 # Regular Python class for local use (non-fal.App)
 class RealtimeGenerator(Monitorable):
     
 
-    def __init__(self):
+    def __init__(self, load_local_pipeline: bool = False, load_ltx23_pipeline: bool = False):
         self.pipeline = None
+        self.pipeline_v23 = None
+        self.load_local_pipeline = load_local_pipeline
+        self.load_ltx23_pipeline = load_ltx23_pipeline
         
         # Performance tracking for video generation
         self.total_videos = 0
@@ -59,31 +88,35 @@ class RealtimeGenerator(Monitorable):
 
 
     def setup(self):
+        if self.load_ltx23_pipeline:
+            self._setup_ltx23()
+        elif self.load_local_pipeline:
+            self._setup_ltxv1()
+        else:
+            print("⏩ Skipping local pipeline load (API-only mode)")
+
+    def _setup_ltxv1(self):
         import os
         import torch
 
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        
-        # Enable memory optimizations
-        torch.backends.cuda.matmul.allow_tf32 = True  # Faster matmul
-        torch.backends.cudnn.allow_tf32 = True       # Faster convolutions
-        
-        print("🚀 Loading main pipeline (image-to-video only)...")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        print("🚀 Loading ltxv1 pipeline (image-to-video)...")
         checkpoint_dir = safe_snapshot_download(
             repo_id=MODEL_ID,
             revision=REVISION,
             local_dir=WEIGHTS_DIR,
             local_dir_use_symlinks=True,
         )
+        preload_files(checkpoint_dir, parallelism=32)
         self.pipeline = LTXConditionPipeline.from_pretrained(
-            checkpoint_dir, 
+            checkpoint_dir,
             torch_dtype=torch.bfloat16,
             use_safetensors=True,
         )
         self.pipeline.to("cuda")
-        
-
-        # Enable optimizations
         self.pipeline.vae.enable_tiling()
 
         if hasattr(self.pipeline, "transformer"):
@@ -96,8 +129,44 @@ class RealtimeGenerator(Monitorable):
             self.pipeline.vae = optimize(self.pipeline.vae)
         else:
             print("No model to optimize")
-        
-        print("✅ Pipeline setup complete!")
+
+        print("✅ ltxv1 pipeline setup complete!")
+
+    def _setup_ltx23(self):
+        import os
+        import torch
+        from diffusers import LTX2ImageToVideoPipeline, AutoModel
+
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        print("🚀 Loading LTX 2.3 distilled FP8 pipeline...")
+        checkpoint_dir = safe_snapshot_download(
+            repo_id=LTX23_MODEL_ID,
+            revision=LTX23_REVISION,
+            local_dir=LTX23_WEIGHTS_DIR,
+            local_dir_use_symlinks=True,
+        )
+        preload_files(checkpoint_dir, parallelism=32)
+
+        transformer = AutoModel.from_pretrained(
+            checkpoint_dir, subfolder="transformer", torch_dtype=torch.bfloat16
+        )
+        transformer.enable_layerwise_casting(
+            storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16
+        )
+
+        self.pipeline_v23 = LTX2ImageToVideoPipeline.from_pretrained(
+            checkpoint_dir, transformer=transformer, torch_dtype=torch.bfloat16
+        )
+        self.pipeline_v23.to("cuda")
+        self.pipeline_v23.vae.enable_tiling()
+
+        if hasattr(self.pipeline_v23, "transformer"):
+            self.pipeline_v23.transformer = optimize(self.pipeline_v23.transformer)
+
+        print("✅ LTX 2.3 distilled FP8 pipeline setup complete!")
     
 
     def decode_base64_image(self, base64_string: str) -> Image.Image:
@@ -173,12 +242,12 @@ class RealtimeGenerator(Monitorable):
             os.unlink(tmp_path)
     
     def generate_video_with_fal_api(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
-        """Generate video using fal.ai ltxv2-preview API"""
+        """Generate video using fal.ai LTX 2.3 Fast API"""
         import time
         import traceback
         import fal_client
         
-        print(f"🎬 Starting fal.ai ltxv2-preview generation")
+        print(f"🎬 Starting fal.ai LTX 2.3 Fast generation")
         print(f"   Prompt: {request.prompt}")
         print(f"   Duration: {request.duration}s")
         print(f"   Resolution: {request.resolution}")
@@ -193,35 +262,32 @@ class RealtimeGenerator(Monitorable):
                 # Add data URI prefix if it's just base64
                 image_data = f"data:image/jpeg;base64,{image_data}"
             
-            # Prepare fal API request - match exact API schema
             fal_input = {
                 "image_url": image_data,
                 "prompt": request.prompt,
+                "generate_audio": False,
             }
             
-            # Add optional parameters only if they're set
             if request.duration:
-                fal_input["duration"] = int(request.duration)  # Must be int, not string
+                fal_input["duration"] = int(request.duration)
             if request.resolution:
-                fal_input["resolution"] = request.resolution  # String: "720p", "1080p", "1440p"
+                fal_input["resolution"] = request.resolution
             if request.aspect_ratio:
-                fal_input["aspect_ratio"] = request.aspect_ratio  # String: "9:16", "16:9"
-            if request.enable_prompt_expansion is not None:
-                fal_input["enable_prompt_expansion"] = request.enable_prompt_expansion  # Boolean
+                fal_input["aspect_ratio"] = request.aspect_ratio
             
             print(f"🚀 Calling fal.ai API...")
             print(f"🔑 FAL_KEY set: {bool(os.getenv('FAL_KEY'))}")
             print(f"📦 Input parameters:")
             print(f"   - prompt: {fal_input['prompt'][:50]}...")
             print(f"   - duration: {fal_input.get('duration', 6)}")
-            print(f"   - resolution: {fal_input.get('resolution', '720p')}")
+            print(f"   - resolution: {fal_input.get('resolution', '1080p')}")
             print(f"   - aspect_ratio: {fal_input.get('aspect_ratio', '16:9')}")
             print(f"   - image_url length: {len(image_data)}")
             
             # Call fal API with subscribe (waits for completion)
             print(f"⏳ Waiting for fal.ai to complete generation...")
             result = fal_client.subscribe(
-                "fal-ai/ltxv-2-preview/image-to-video/fast",
+                "fal-ai/ltx-2.3/image-to-video/fast",
                 arguments=fal_input,
                 with_logs=True,
             )
@@ -259,13 +325,61 @@ class RealtimeGenerator(Monitorable):
     
     def generate_video_from_image(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Main entry point - routes to appropriate backend based on model_type"""
-        
-        # Route to fal API for ltxv2-preview
-        if request.model_type == "ltxv2-preview":
+        if request.model_type == "ltx-2.3":
             return self.generate_video_with_fal_api(request)
-        
-        # Otherwise use local HuggingFace pipeline
+        if request.model_type == "ltx-2.3-local":
+            return self.generate_video_with_local_v23(request)
         return self.generate_video_with_local_pipeline(request)
+
+    def generate_video_with_local_v23(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
+        """Generate video using local LTX 2.3 distilled FP8 pipeline"""
+        import torch
+        import time
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+
+        if self.pipeline_v23 is None:
+            raise RuntimeError("LTX 2.3 pipeline not loaded. Set LOAD_LTX23_PIPELINE=true.")
+
+        print(f"🎬 Starting local LTX 2.3 generation - {request.num_frames} frames")
+
+        input_image = self.decode_base64_image(request.image_base64)
+        input_image = input_image.resize((request.width, request.height))
+
+        print(f"📏 Resolution: {request.width}x{request.height}")
+        print(f"📝 Prompt: {request.prompt[:80]}...")
+
+        start_time = time.time()
+
+        try:
+            video, audio = self.pipeline_v23(
+                image=input_image,
+                prompt=request.prompt,
+                negative_prompt=request.negative_prompt,
+                width=request.width,
+                height=request.height,
+                num_frames=request.num_frames,
+                num_inference_steps=8,
+                sigmas=DISTILLED_SIGMA_VALUES,
+                guidance_scale=1.0,
+                stg_scale=0.0,
+                modality_scale=1.0,
+                generator=torch.Generator(device="cuda").manual_seed(0),
+                output_type="pil",
+                return_dict=False,
+            )
+
+            frames = video[0]
+
+            self.last_generation_time = time.time() - start_time
+            self.total_generation_time += self.last_generation_time
+            self.total_videos += 1
+
+            print(f"✅ LTX 2.3 local generation completed in {self.last_generation_time:.2f}s!")
+        except Exception as e:
+            print(f"❌ LTX 2.3 local generation failed: {e}")
+            raise
+
+        return LTXVideoResponseWithFrames(frames=frames)
     
     def generate_video_with_local_pipeline(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate video using local HuggingFace LTX pipeline (ltxv1)"""
@@ -336,7 +450,7 @@ class RealtimeGenerator(Monitorable):
             "videos_generated": self.total_videos,
             "avg_generation_time": round(avg_generation_time, 2),
             "last_generation_time": round(self.last_generation_time, 2),
-            "ready": self.pipeline is not None
+            "ready": self.pipeline is not None or self.pipeline_v23 is not None
         }
 
 

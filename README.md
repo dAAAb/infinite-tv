@@ -172,16 +172,15 @@ All authentication is handled automatically - you never need to manually add the
 }
 ```
 
-**LTX v2 Preview (fal.ai API):**
+**LTX 2.3 Fast (fal.ai API):**
 ```json
 {
-  "model": "ltxv2-preview",
+  "model": "ltx-2.3",
   "initial_prompt": "A cinematic video with smooth camera movement",
   "initial_image_url": "https://example.com/image.jpg",
   "duration": 6,
-  "resolution": "720p",
-  "aspect_ratio": "16:9",
-  "enable_prompt_expansion": true
+  "resolution": "1080p",
+  "aspect_ratio": "16:9"
 }
 ```
 
@@ -192,7 +191,7 @@ All authentication is handled automatically - you never need to manually add the
 Choose between two video generation backends:
 
 - **`ltxv1`** (default): Local HuggingFace LTX pipeline with full customization
-- **`ltxv2-preview`**: fal.ai hosted LTX v2 Preview with faster inference
+- **`ltx-2.3`**: fal.ai hosted LTX 2.3 Fast (22B model) with sharper output and faster inference
 
 ### Video Generation Parameters
 
@@ -204,11 +203,10 @@ Choose between two video generation backends:
 - **`target_fps`**: Streaming frame rate (default: 9.0)
 - **`timesteps`**: Custom timesteps for diffusion process
 
-**LTX v2 Preview (fal.ai API):**
-- **`duration`**: Video duration - 6 or 8 seconds
-- **`resolution`**: Output resolution - 720p, 1080p, or 1440p
-- **`aspect_ratio`**: Video aspect ratio - 16:9 or 9:16
-- **`enable_prompt_expansion`**: Auto-enhance prompts (default: true)
+**LTX 2.3 Fast (fal.ai API):**
+- **`duration`**: Video duration - 6 to 20 seconds (>10s requires 25fps and 1080p)
+- **`resolution`**: Output resolution - 1080p, 1440p, or 2160p
+- **`aspect_ratio`**: Video aspect ratio - auto, 16:9, or 9:16
 
 ### Streaming Configuration
 

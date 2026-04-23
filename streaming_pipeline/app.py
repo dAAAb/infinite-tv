@@ -7,13 +7,21 @@ from dotenv import load_dotenv
 
 #load_dotenv()
 
-# Python requirements (FFmpeg is pre-installed in fal base images)
+# Python requirements (FFmpeg is pre-installed in fal base images).
+# Torch must match the GPU-B200 driver's CUDA version (12.8), so we pull
+# the +cu128 wheels from PyTorch's index. fal passes each list entry as a
+# single argv to `uv pip install`, so "--extra-index-url" and its URL
+# must be SEPARATE entries (not one space-joined string).
 requirements = [
-    "torch>=2.1.0",
-    "diffusers>=0.28.2",
+    "--extra-index-url",
+    "https://download.pytorch.org/whl/cu128",
+    "torch==2.7.1+cu128",
+    "torchvision==0.22.1+cu128",
+    "git+https://github.com/huggingface/diffusers.git@main",
     "transformers>=4.47.2,<4.52.0",
     "sentencepiece>=0.1.96",
     "huggingface-hub~=0.30",
+    "hf_transfer",  # Activates HF_HUB_ENABLE_HF_TRANSFER=1 in video_generator.setup()
     "einops",
     "timm",
     "accelerate==1.4.0",
@@ -27,9 +35,10 @@ requirements = [
     "uvicorn",
     "pydantic",
     "av",
-    "torchvision",
-    "fal_client>=0.5.0",  # For ltxv2-preview API calls
+    "fal_client>=0.5.0",  # For LTX 2.3 API calls
     "requests>=2.28.0",   # For downloading generated videos
+    "httpx>=0.27.0",      # For TTS API calls
+    "pydub>=0.25.1",      # For audio processing
 ]
 
 class RealtimeStreamingApp(
@@ -40,11 +49,9 @@ class RealtimeStreamingApp(
     keep_alive=1000
 ):
     machine_type = "GPU-B200"
-    requirements=requirements
-    
+    requirements = requirements
+    python_version = "3.11"
 
-    
-    
     def setup(self):
         """Setup with monitoring"""
         print(" Setting up complete streaming pipeline...")

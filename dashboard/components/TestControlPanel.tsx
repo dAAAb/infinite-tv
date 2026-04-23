@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react'
 import { Play, Square, Upload, Settings, Sliders, Zap } from 'lucide-react'
-import type { TestConfig, LTXv1Config, LTXv2Config, ModelType } from '../types'
+import type { TestConfig, LTXv1Config, LTXv2Config, LTX23LocalConfig, ModelType } from '../types'
 
 interface TestControlPanelProps {
   onStartTest: (config: TestConfig) => void
@@ -29,17 +29,28 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
   })
 
   const [ltxv2Config, setLtxv2Config] = useState<LTXv2Config>({
-    model: 'ltxv2-preview',
+    model: 'ltx-2.3',
     image_url: "https://storage.googleapis.com/remade-v2/uploads/a185f836a3e9ca84cc75f5c12bb10dd4.jpg",
     prompt: "A cinematic video with smooth camera movement and realistic motion",
     duration: 6,
-    resolution: '720p',
+    resolution: '1080p',
     aspect_ratio: '16:9',
-    enable_prompt_expansion: true,
     // Streaming parameters
     target_fps: 14.0,
     width: 640,
     height: 480,
+  })
+
+  const [ltx23LocalConfig, setLtx23LocalConfig] = useState<LTX23LocalConfig>({
+    model: 'ltx-2.3-local',
+    initial_prompt: "A cinematic video with smooth camera movement and realistic motion",
+    initial_image_url: "https://storage.googleapis.com/remade-v2/uploads/a185f836a3e9ca84cc75f5c12bb10dd4.jpg",
+    negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted",
+    height: 512,
+    width: 768,
+    num_frames: 121,
+    target_fps: 14.0,
+    mode: 'regular'
   })
 
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -47,12 +58,16 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
   const fileInputRef = useRef<HTMLInputElement>(null)
   
   // Get current config based on selected model
-  const config = selectedModel === 'ltxv1' ? ltxv1Config : ltxv2Config
+  const config = selectedModel === 'ltxv1' ? ltxv1Config 
+    : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig 
+    : ltxv2Config
   
   // Computed prompt value that includes nightmare prefix when needed (LTXv1 only)
   const displayedPrompt = selectedModel === 'ltxv1' && ltxv1Config.mode === 'nightmare' && !ltxv1Config.initial_prompt.startsWith('(Nightmare Started)')
     ? `(Nightmare Started) ${ltxv1Config.initial_prompt}`
-    : selectedModel === 'ltxv1' ? ltxv1Config.initial_prompt : ltxv2Config.prompt
+    : selectedModel === 'ltxv1' ? ltxv1Config.initial_prompt 
+    : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_prompt
+    : ltxv2Config.prompt
 
   const handleImageUpload = async (file: File) => {
     // Simple validation
@@ -75,17 +90,12 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
       reader.onload = (e) => {
         const result = e.target?.result as string
         
-        // Update the appropriate config based on selected model
         if (selectedModel === 'ltxv1') {
-          setLtxv1Config(prev => ({ 
-            ...prev, 
-            initial_image_url: result
-          }))
+          setLtxv1Config(prev => ({ ...prev, initial_image_url: result }))
+        } else if (selectedModel === 'ltx-2.3-local') {
+          setLtx23LocalConfig(prev => ({ ...prev, initial_image_url: result }))
         } else {
-          setLtxv2Config(prev => ({ 
-            ...prev, 
-            image_url: result
-          }))
+          setLtxv2Config(prev => ({ ...prev, image_url: result }))
         }
         
         console.log('✅ Image converted successfully')
@@ -132,7 +142,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
         {/* Model Selector */}
         <div>
           <label className="metric-label mb-3 block">Select Model</label>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <button
               type="button"
               onClick={() => setSelectedModel('ltxv1')}
@@ -144,25 +154,41 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
             >
               <div className="flex items-center justify-center space-x-2">
                 <Zap className="w-4 h-4" />
-                <span>LTX v1 (Streaming)</span>
+                <span>LTX v1</span>
               </div>
-              <p className="text-xs mt-1 opacity-75">Real-time streaming pipeline</p>
+              <p className="text-xs mt-1 opacity-75">Local 0.9.8 pipeline</p>
             </button>
             
             <button
               type="button"
-              onClick={() => setSelectedModel('ltxv2-preview')}
+              onClick={() => setSelectedModel('ltx-2.3')}
               className={`px-4 py-3 rounded-lg text-sm font-medium transition-all border-2 ${
-                selectedModel === 'ltxv2-preview'
+                selectedModel === 'ltx-2.3'
                   ? 'bg-fal-primary-500 text-white border-fal-primary-500 shadow-lg'
                   : 'bg-white text-fal-gray-700 hover:bg-fal-gray-50 border-fal-gray-300'
               }`}
             >
               <div className="flex items-center justify-center space-x-2">
                 <Zap className="w-4 h-4" />
-                <span>LTX v2 Preview</span>
+                <span>LTX 2.3 API</span>
               </div>
-              <p className="text-xs mt-1 opacity-75">New image-to-video model</p>
+              <p className="text-xs mt-1 opacity-75">fal.ai hosted</p>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSelectedModel('ltx-2.3-local')}
+              className={`px-4 py-3 rounded-lg text-sm font-medium transition-all border-2 ${
+                selectedModel === 'ltx-2.3-local'
+                  ? 'bg-fal-primary-500 text-white border-fal-primary-500 shadow-lg'
+                  : 'bg-white text-fal-gray-700 hover:bg-fal-gray-50 border-fal-gray-300'
+              }`}
+            >
+              <div className="flex items-center justify-center space-x-2">
+                <Zap className="w-4 h-4" />
+                <span>LTX 2.3 Local</span>
+              </div>
+              <p className="text-xs mt-1 opacity-75">22B distilled FP8</p>
             </button>
           </div>
         </div>
@@ -181,11 +207,12 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                   let newPrompt = e.target.value
                   
                   if (selectedModel === 'ltxv1') {
-                    // Remove nightmare prefix if user is editing and it exists
                     if (newPrompt.startsWith('(Nightmare Started) ')) {
                       newPrompt = newPrompt.replace('(Nightmare Started) ', '')
                     }
                     setLtxv1Config(prev => ({ ...prev, initial_prompt: newPrompt }))
+                  } else if (selectedModel === 'ltx-2.3-local') {
+                    setLtx23LocalConfig(prev => ({ ...prev, initial_prompt: newPrompt }))
                   } else {
                     setLtxv2Config(prev => ({ ...prev, prompt: newPrompt }))
                   }
@@ -243,8 +270,8 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
               </div>
             )}
             
-            {/* LTXv2 Options */}
-            {selectedModel === 'ltxv2-preview' && (
+            {/* LTX 2.3 Options */}
+            {selectedModel === 'ltx-2.3' && (
               <>
                 <div>
                   <label className="metric-label mb-2 block">Duration</label>
@@ -280,13 +307,13 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                     value={ltxv2Config.resolution}
                     onChange={(e) => setLtxv2Config(prev => ({ 
                       ...prev, 
-                      resolution: e.target.value as '720p' | '1080p' | '1440p' 
+                      resolution: e.target.value as '1080p' | '1440p' | '2160p' 
                     }))}
                     className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 text-sm"
                   >
-                    <option value="720p">720p</option>
                     <option value="1080p">1080p</option>
                     <option value="1440p">1440p</option>
+                    <option value="2160p">2160p (4K)</option>
                   </select>
                 </div>
                 
@@ -358,17 +385,17 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                   className={`relative border-2 border-dashed rounded-lg transition-all ${
                     uploadingImage 
                       ? 'border-fal-primary-400 bg-fal-primary-50' 
-                      : (selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : ltxv2Config.image_url)
+                      : (selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : ltxv2Config.image_url)
                         ? 'border-fal-gray-300 bg-fal-gray-50' 
                         : 'border-fal-gray-300 bg-fal-gray-100 hover:border-fal-primary-400 hover:bg-fal-primary-50 cursor-pointer'
                   }`}
                   onClick={() => !uploadingImage && fileInputRef.current?.click()}
                 >
-                  {(selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : ltxv2Config.image_url) ? (
+                  {(selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : ltxv2Config.image_url) ? (
                     // Image Preview State - Click to replace
                     <div className="relative group cursor-pointer">
                       <img
-                        src={selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : ltxv2Config.image_url}
+                        src={selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : ltxv2Config.image_url}
                         alt="Initial frame"
                         className="w-full max-h-48 object-contain rounded"
                         onError={(e) => {
@@ -387,6 +414,8 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                           e.stopPropagation()
                           if (selectedModel === 'ltxv1') {
                             setLtxv1Config(prev => ({ ...prev, initial_image_url: '' }))
+                          } else if (selectedModel === 'ltx-2.3-local') {
+                            setLtx23LocalConfig(prev => ({ ...prev, initial_image_url: '' }))
                           } else {
                             setLtxv2Config(prev => ({ ...prev, image_url: '' }))
                           }
@@ -425,11 +454,13 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
               <label className="metric-label mb-2 block text-xs">Target FPS</label>
               <input
                 type="number"
-                value={selectedModel === 'ltxv1' ? ltxv1Config.target_fps : ltxv2Config.target_fps}
+                value={selectedModel === 'ltxv1' ? ltxv1Config.target_fps : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.target_fps : ltxv2Config.target_fps}
                 onChange={(e) => {
                   const value = parseFloat(e.target.value)
                   if (selectedModel === 'ltxv1') {
                     setLtxv1Config(prev => ({ ...prev, target_fps: value }))
+                  } else if (selectedModel === 'ltx-2.3-local') {
+                    setLtx23LocalConfig(prev => ({ ...prev, target_fps: value }))
                   } else {
                     setLtxv2Config(prev => ({ ...prev, target_fps: value }))
                   }
@@ -445,11 +476,13 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
               <label className="metric-label mb-2 block text-xs">Stream Width</label>
               <input
                 type="number"
-                value={selectedModel === 'ltxv1' ? ltxv1Config.width : ltxv2Config.width}
+                value={selectedModel === 'ltxv1' ? ltxv1Config.width : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.width : ltxv2Config.width}
                 onChange={(e) => {
                   const value = parseInt(e.target.value)
                   if (selectedModel === 'ltxv1') {
                     setLtxv1Config(prev => ({ ...prev, width: value }))
+                  } else if (selectedModel === 'ltx-2.3-local') {
+                    setLtx23LocalConfig(prev => ({ ...prev, width: value }))
                   } else {
                     setLtxv2Config(prev => ({ ...prev, width: value }))
                   }
@@ -465,11 +498,13 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
               <label className="metric-label mb-2 block text-xs">Stream Height</label>
               <input
                 type="number"
-                value={selectedModel === 'ltxv1' ? ltxv1Config.height : ltxv2Config.height}
+                value={selectedModel === 'ltxv1' ? ltxv1Config.height : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.height : ltxv2Config.height}
                 onChange={(e) => {
                   const value = parseInt(e.target.value)
                   if (selectedModel === 'ltxv1') {
                     setLtxv1Config(prev => ({ ...prev, height: value }))
+                  } else if (selectedModel === 'ltx-2.3-local') {
+                    setLtx23LocalConfig(prev => ({ ...prev, height: value }))
                   } else {
                     setLtxv2Config(prev => ({ ...prev, height: value }))
                   }
@@ -482,9 +517,9 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
             </div>
           </div>
           <p className="text-xs text-fal-gray-600 mt-2">
-            {selectedModel === 'ltxv2-preview' 
-              ? 'Stream resolution: Videos are resized from ltxv2 output to these dimensions for streaming'
-              : 'Generation and streaming resolution'}
+            {selectedModel === 'ltx-2.3'
+              ? 'Stream resolution: Videos are resized from LTX 2.3 API output to these dimensions for streaming'
+              : 'Generation and streaming resolution (must be divisible by 32)'}
           </p>
         </div>
 
@@ -567,18 +602,13 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
             {!isStreaming ? (
               <button
                 onClick={() => {
-                  // Create config based on selected model
                   if (selectedModel === 'ltxv1') {
-                    const processedConfig: TestConfig = {
-                      ...ltxv1Config,
-                      initial_prompt: displayedPrompt
-                    }
-                    onStartTest(processedConfig)
+                    onStartTest({ ...ltxv1Config, initial_prompt: displayedPrompt })
+                  } else if (selectedModel === 'ltx-2.3-local') {
+                    onStartTest({ ...ltx23LocalConfig, initial_prompt: displayedPrompt })
                   } else {
-                    // For ltxv2, normalize field names to match backend API
                     const processedConfig: any = {
                       ...ltxv2Config,
-                      // Map ltxv2 image_url to initial_image_url for backend
                       initial_image_url: ltxv2Config.image_url,
                       initial_prompt: ltxv2Config.prompt
                     }

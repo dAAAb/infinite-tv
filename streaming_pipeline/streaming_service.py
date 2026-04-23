@@ -28,8 +28,12 @@ class StreamingService:
             
     
         
-        # Initialize the video generator
-        self.video_generator = RealtimeGenerator()
+        load_local = os.getenv("LOAD_LOCAL_PIPELINE", "false").lower() == "true"
+        load_ltx23 = os.getenv("LOAD_LTX23_PIPELINE", "true").lower() == "true"
+        self.video_generator = RealtimeGenerator(
+            load_local_pipeline=load_local,
+            load_ltx23_pipeline=load_ltx23,
+        )
         self.video_generator.setup()
         
         # Get environment variables
@@ -120,9 +124,6 @@ class StreamingService:
             if request.aspect_ratio:
                 ltx_updates['aspect_ratio'] = request.aspect_ratio
                 print(f"   📏 Aspect Ratio: {request.aspect_ratio}")
-            if request.enable_prompt_expansion is not None:
-                ltx_updates['enable_prompt_expansion'] = request.enable_prompt_expansion
-            
             # Apply all updates at once
             if ltx_updates:
                 self.video_streamer.update_ltx_config(**ltx_updates)
