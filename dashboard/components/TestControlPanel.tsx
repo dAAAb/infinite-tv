@@ -87,7 +87,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
     spatio_temporal_guidance_blocks: null,
     noise_scale: 0.15,
     seed: null,
-    enable_audio: false,
+    enable_audio: true,
   })
 
   const [showAdvanced, setShowAdvanced] = useState(false)

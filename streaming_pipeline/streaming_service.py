@@ -151,6 +151,17 @@ class StreamingService:
                 self.rtmp_streamer.fps = request.target_fps
                 print(f"   🎛️ Set target_fps: {request.target_fps}")
 
+            # Keep generation frame_rate aligned with the RTMP stream's FPS so
+            # the LTX 2.3 audio path (duration_s = num_frames / frame_rate)
+            # produces audio that matches actual playback duration.  Honour an
+            # explicit request.frame_rate override if the caller set one.
+            effective_frame_rate = request.frame_rate
+            if effective_frame_rate is None and request.target_fps:
+                effective_frame_rate = float(request.target_fps)
+            if effective_frame_rate is not None:
+                ltx_updates['frame_rate'] = float(effective_frame_rate)
+                print(f"   🎬 frame_rate: {effective_frame_rate} (audio duration matches stream playback)")
+
             # Toggle native audio per request.  Only affects the next
             # start_stream() call, so this needs to happen before
             # video_streamer.start_streaming() spins up RTMP.

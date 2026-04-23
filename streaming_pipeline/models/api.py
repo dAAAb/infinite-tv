@@ -23,6 +23,9 @@ class StartStreamRequest(BaseModel):
     height: Optional[int] = Field(default=384, description="The height of the video (must be divisible by 32)")
     width: Optional[int] = Field(default=512, description="The width of the video (must be divisible by 32)")
     num_frames: Optional[int] = Field(default=121, description="The number of frames to generate (must be 8*k + 1)")
+    # If unset, streaming_service auto-fills this from target_fps so audio
+    # length matches the RTMP stream's playback duration.
+    frame_rate: Optional[float] = Field(default=None, description="Generation frame rate (defaults to target_fps to keep audio in sync with playback)")
     strength: Optional[float] = Field(default=1.0, description="How much to follow the input image")
     guidance_scale: Optional[float] = Field(default=3.0, description="Classifier-free guidance scale (1=off, 3-4 typical for distilled)")
     timesteps: Optional[List[float]] = Field(default=[1000, 981, 909, 725, 0.03], description="The timesteps to use")
@@ -41,4 +44,4 @@ class StartStreamRequest(BaseModel):
     # Streaming Configuration
     target_fps: Optional[float] = Field(default=9.0, description="Target streaming FPS")
     mode: Optional[str] = Field(default="regular", description="Generation mode: 'regular' or 'nightmare'")
-    enable_audio: Optional[bool] = Field(default=False, description="Stream LTX 2.3's natively-generated audio instead of silent anullsrc (ltx-2.3-local only)")
+    enable_audio: Optional[bool] = Field(default=True, description="Stream LTX 2.3's natively-generated audio instead of silent anullsrc (ltx-2.3-local only)")

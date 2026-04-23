@@ -16,6 +16,10 @@ class LTXVideoRequestI2V(BaseModel):
     height: int = Field(default=384, description="The height of the video (must be divisible by 32)")
     width: int = Field(default=512, description="The width of the video (must be divisible by 32)")
     num_frames: int = Field(default=121, description="The number of frames to generate (must be 8*k + 1)")
+    # Drives `duration_s = num_frames / frame_rate` inside the LTX 2.3 pipeline,
+    # which determines how long the generated audio is.  Should match the RTMP
+    # stream's target_fps so audio playback duration aligns with video playback.
+    frame_rate: float = Field(default=14.0, description="Generation frame rate; should match RTMP target_fps for in-sync audio")
     strength: float = Field(default=1.0, description="How much to follow the input image")
     guidance_scale: float = Field(default=3.0, description="Classifier-free guidance scale (1=off, 3-4 typical for distilled)")
     timesteps: List[float] = Field(default=[1000, 993, 987, 981, 975, 909, 725, 0.03], description="The timesteps to use")

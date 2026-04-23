@@ -395,7 +395,7 @@ class RealtimeGenerator(Monitorable):
 
         print(f"📏 Resolution: {request.width}x{request.height}")
         print(f"📝 Prompt: {request.prompt[:80]}...")
-        print(f"🎚️ guidance_scale={request.guidance_scale}, stg_scale={request.stg_scale}, noise_scale={request.noise_scale}, seed={seed}")
+        print(f"🎚️ guidance_scale={request.guidance_scale}, stg_scale={request.stg_scale}, noise_scale={request.noise_scale}, seed={seed}, frame_rate={request.frame_rate} (audio duration = {request.num_frames / request.frame_rate:.2f}s)")
 
         start_time = time.time()
 
@@ -410,6 +410,10 @@ class RealtimeGenerator(Monitorable):
             width=request.width,
             height=request.height,
             num_frames=request.num_frames,
+            # frame_rate drives `duration_s = num_frames / frame_rate` which
+            # determines the generated audio length; passing the RTMP stream's
+            # target_fps keeps audio length aligned with video playback.
+            frame_rate=float(request.frame_rate),
             num_inference_steps=8,
             sigmas=DISTILLED_SIGMA_VALUES,
             guidance_scale=request.guidance_scale,
