@@ -266,40 +266,45 @@ class RealtimeVideoStreamer(Monitorable):
         asyncio.run(self._generation_loop())  # This properly runs the async function
     
     async def _generation_loop(self):
-        """Continuous generation loop with no gaps"""
-        # Flag to track if this is the first generation
+        """Continuous generation loop with no gaps.
+
+        Prompt generation must run AFTER video generation completes, because
+        the prompt generator's vision LLM analyzes the most recent frame to
+        steer the next clip.  Overlapping them would feed the LLM a stale
+        frame from the previous video.
+        """
         first_generation = True
-        
+
         while self.state.is_running:
             try:
                 # For first generation, don't start prompt generation task
                 if not first_generation:
-                    # Start prompt generation for NEXT video (in parallel)
+                    # Start prompt generation for NEXT video (sequential with current frame)
                     if not self.prompt_generation_task:
                         self.prompt_generation_task = asyncio.create_task(
                             self._prepare_next_prompt()
                         )
-                
+
                 # Generate current video
                 await self._generate_next_video(use_initial_prompt=first_generation)
-                
+
                 first_generation = False  # After first generation, use normal flow
-                
+
                 # No sleep! Immediately continue to next generation
-                
+
             except Exception as e:
                 generation_log.error(f"❌ Generation error: {e}")
                 generation_log.info(f"🔄 Continuing with next generation attempt...")
-                
+
                 # Important: Still mark first_generation as False even if it failed
                 # This prevents getting stuck in initial prompt mode
                 first_generation = False
-                
+
                 # Cancel any pending prompt generation task to start fresh
                 if self.prompt_generation_task:
                     self.prompt_generation_task.cancel()
                     self.prompt_generation_task = None
-                
+
                 await asyncio.sleep(1)  # Brief pause on error only
     
     async def _prepare_next_prompt(self):
@@ -338,22 +343,22 @@ class RealtimeVideoStreamer(Monitorable):
     
     async def _generate_next_video(self, use_initial_prompt=False):
         """Generate video using pre-prepared prompt or initial prompt for first generation"""
-        
+
         # Track whether a user comment was used for dynamic parameter adjustment
         used_comment = False
-        
+
         if use_initial_prompt:
             # For the FIRST generation, use the initial prompt directly
             generation_log.info(f"🎬 Generation #1 (INITIAL)")
             generation_log.info(f"📝 Using initial prompt: {self.state.current_prompt}")
-            
+
             prompt_to_use = self.state.current_prompt
             selected_comment = None
             used_comment = False  # Initial prompt is not a user comment
-            
+
             # Show initial prompt on overlay
             self.text_overlay.set_prompt(prompt_to_use)
-        
+
         else:
             # For subsequent generations, use the normal prompt generation process
             # Wait for prompt to be ready (should already be done)
@@ -363,31 +368,31 @@ class RealtimeVideoStreamer(Monitorable):
             else:
                 # Fallback if no pre-generated prompt
                 comments = self.twitch_listener.get_recent_comments(self.comments_lookback)
-                
+
                 # Log fallback LLM input
                 print(f"\n🤖 FALLBACK LLM INPUT:")
                 print(f"   💬 Recent comments: {len(comments)}")
                 for comment in comments:
                     print(f"   💬 [{comment.username}]: {comment.message}")
-                
+
                 prompt_result = self.prompt_generator.generate_prompt(comments, self.state)
-                
+
                 # Log fallback LLM output
                 print(f"🤖 FALLBACK LLM OUTPUT:")
                 print(f"   🧠 LLM Reasoning: {prompt_result.reasoning}")
                 print(f"   📝 Generated Prompt: {prompt_result.prompt}")
-            
+
             generation_log.info(f"🎬 Generation #{self.state.generation_count + 1}")
             if prompt_result.selected_comment:
                 generation_log.info(f"💬 Selected: [{prompt_result.selected_comment.username}] {prompt_result.selected_comment.message}")
             else:
                 generation_log.info(f"🌱 Evolution: {prompt_result.reasoning}")
             generation_log.info(f"📝 Prompt: {prompt_result.prompt}")
-            
+
             prompt_to_use = prompt_result.prompt
             selected_comment = prompt_result.selected_comment
             used_comment = selected_comment is not None  # Track if comment was used
-            
+
             # Set the overlay text (RealtimeVideoStreamer controls presentation)
             if selected_comment:
                 # Show the selected comment
@@ -398,20 +403,18 @@ class RealtimeVideoStreamer(Monitorable):
             else:
                 # Show the AI-generated prompt when no comment is selected
                 self.text_overlay.set_prompt(prompt_to_use)
-        
+
         # Generate video (same for both initial and subsequent generations)
         try:
             current_frame_preview = self.state.current_frame_base64[:50] + "..." if self.state.current_frame_base64 else "None"
             print(f"🎬 Using input frame: {current_frame_preview}")
-            
-            # Create base request from current configuration
+
             request_dict = self.ltx_config.dict()
             request_dict.update({
                 "prompt": prompt_to_use,
                 "image_base64": self.state.current_frame_base64
             })
-            
-            # Apply user comment parameter overrides if using a comment
+
             if used_comment:
                 comment_params = UserCommentParams()
                 request_dict.update({
@@ -421,10 +424,9 @@ class RealtimeVideoStreamer(Monitorable):
                 print(f"🎯 Using COMMENT mode: guidance={comment_params.guidance_scale}, strength={comment_params.strength}")
             else:
                 print(f"🌱 Using EVOLUTION mode: guidance={request_dict['guidance_scale']}, strength={request_dict['strength']}")
-            
+
             request = LTXVideoRequestI2V(**request_dict)
-            
-            # Log all LTX parameters being used
+
             print(f"🎛️ LTX Request Parameters:")
             print(f"   📝 prompt: {request.prompt}")
             print(f"   📝 negative_prompt: {request.negative_prompt}")
@@ -433,8 +435,7 @@ class RealtimeVideoStreamer(Monitorable):
             print(f"   💪 strength: {request.strength}")
             print(f"   🎯 guidance_scale: {request.guidance_scale}")
             print(f"   ⏱️ timesteps: {request.timesteps}")
-            
-            # Store generation parameters in history (last 10)
+
             import time
             generation_params = {
                 "timestamp": time.time(),
@@ -449,12 +450,14 @@ class RealtimeVideoStreamer(Monitorable):
                 "timesteps": request.timesteps
             }
             self.generation_params_history.append(generation_params)
-            # Keep only last 10 generations
             self.generation_params_history = self.generation_params_history[-10:]
-            
-            # Get video result with frames for RTMP streaming
+
+            # Run video generation on the GPU thread.  The prompt task for
+            # the NEXT clip is created by the outer _generation_loop AFTER
+            # this returns and the state is updated, so it can use the just-
+            # produced last frame as visual context.
             video_result = await asyncio.to_thread(
-                self.realtime_generator.generate_video_from_image, 
+                self.realtime_generator.generate_video_from_image,
                 request
             )
             
@@ -466,14 +469,20 @@ class RealtimeVideoStreamer(Monitorable):
                 
             if self.rtmp_streamer and video_result.frames:
                 generation_log.info(f"📺 PROCESSING {len(video_result.frames)} frames with overlay...")
-                
+
                 # Apply text overlay to all frames using batch processing
                 overlaid_frames = self.text_overlay.apply_overlay_batch(video_result.frames)
-                
+
                 generation_log.info(f"📺 SENDING {len(overlaid_frames)} frames to RTMP streamer...")
                 processed_count = self.rtmp_streamer.add_frame_batch(overlaid_frames)
                 generation_log.info(f"📺 RTMP processed: {processed_count}/{len(overlaid_frames)} frames")
-          
+
+                # Forward the matching audio chunk (no-op if audio disabled or
+                # if the model didn't produce audio this cycle).
+                audio_pcm = getattr(video_result, "audio_pcm", None)
+                if audio_pcm:
+                    self.rtmp_streamer.add_audio_chunk(audio_pcm)
+
             elif not self.rtmp_streamer:
                 generation_log.error("❌ NO FRAME STREAMER SET!")
             elif not video_result.frames:

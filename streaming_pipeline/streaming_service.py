@@ -113,7 +113,25 @@ class StreamingService:
                 ltx_updates['width'] = request.width
             if request.height:
                 ltx_updates['height'] = request.height
-            
+
+            # LTX 2.3-local fixation-control parameters
+            if request.stg_scale is not None:
+                ltx_updates['stg_scale'] = request.stg_scale
+                print(f"   🌀 stg_scale: {request.stg_scale}")
+            if request.spatio_temporal_guidance_blocks is not None:
+                ltx_updates['spatio_temporal_guidance_blocks'] = request.spatio_temporal_guidance_blocks
+                print(f"   🌀 stg_blocks: {request.spatio_temporal_guidance_blocks}")
+            if request.noise_scale is not None:
+                ltx_updates['noise_scale'] = request.noise_scale
+                print(f"   🔊 noise_scale: {request.noise_scale}")
+            if request.seed is not None:
+                ltx_updates['seed'] = request.seed
+                print(f"   🌱 seed (pinned): {request.seed}")
+            else:
+                # Explicitly clear any previously-pinned seed so generations stay random
+                ltx_updates['seed'] = None
+                print(f"   🌱 seed: random per generation")
+
             # LTXv2-specific parameters
             if request.duration is not None:
                 ltx_updates['duration'] = request.duration
@@ -132,6 +150,13 @@ class StreamingService:
             if request.target_fps:
                 self.rtmp_streamer.fps = request.target_fps
                 print(f"   🎛️ Set target_fps: {request.target_fps}")
+
+            # Toggle native audio per request.  Only affects the next
+            # start_stream() call, so this needs to happen before
+            # video_streamer.start_streaming() spins up RTMP.
+            if request.enable_audio is not None:
+                self.rtmp_streamer.enable_audio = bool(request.enable_audio)
+                print(f"   🔊 enable_audio: {self.rtmp_streamer.enable_audio}")
             
             if request.width and request.height:
                 self.rtmp_streamer.width = request.width

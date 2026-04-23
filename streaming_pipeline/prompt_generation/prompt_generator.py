@@ -103,20 +103,23 @@ class PromptGenerator(Monitorable):
         messages = [{"role": "system", "content": formatted_prompt}]
         
         # Add visual context if enabled and available
+        # Use detail="low" to keep token usage well under Groq's 30k TPM limit.
+        # "low" mode uses ~85 tokens per image regardless of resolution; "high"
+        # uses 1k-3k tokens which causes 429 rate limit errors at our cadence.
         if self.VISUAL_MODE and context.current_frame_base64:
             try:
                 user_message = {
-                    "role": "user", 
+                    "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": "First, describe what you can see in this current frame in detail. Then generate the next video prompt following the system instructions."
+                            "text": "First, briefly describe what you can see in this current frame. Then generate the next video prompt following the system instructions."
                         },
                         {
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{context.current_frame_base64}",
-                                "detail": "high"  # Groq might handle high detail better
+                                "detail": "low"
                             }
                         }
                     ]
@@ -135,15 +138,36 @@ class PromptGenerator(Monitorable):
         import time
         start_time = time.time()
         
-        # Get AI response (same client selection)
+        # Get AI response (same client selection).
+        # On 429 (rate limit), retry once without the image to keep the stream
+        # alive instead of falling all the way back to a generic prompt.
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=400,
-                temperature=0.7,
-                response_format={"type": "json_object"}
-            )
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=400,
+                    temperature=0.7,
+                    response_format={"type": "json_object"}
+                )
+            except Exception as e:
+                err = str(e)
+                is_rate_limit = "429" in err or "rate_limit" in err.lower() or "tokens per minute" in err.lower()
+                if is_rate_limit and self.VISUAL_MODE and len(messages) > 1:
+                    print(f"⚠️ Rate limit hit, retrying text-only without image...")
+                    text_only_messages = [m for m in messages if m.get("role") == "system"]
+                    text_only_messages.append({"role": "user", "content": comment_text or "Generate the next video prompt following the system instructions."})
+                    text_only_model = "llama-3.1-8b-instant" if client == self.groq_client else "gpt-4o-mini"
+                    response = client.chat.completions.create(
+                        model=text_only_model,
+                        messages=text_only_messages,
+                        max_tokens=400,
+                        temperature=0.7,
+                        response_format={"type": "json_object"}
+                    )
+                    print(f"✅ Text-only fallback succeeded with {text_only_model}")
+                else:
+                    raise
             
             # Track timing
             self.last_generation_time = time.time() - start_time

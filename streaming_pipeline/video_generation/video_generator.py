@@ -1,4 +1,3 @@
-from fal.toolkit import optimize
 from diffusers import LTXConditionPipeline
 from PIL import Image
 from io import BytesIO
@@ -39,6 +38,49 @@ def safe_snapshot_download(
     return repo_path
 
 
+def audio_tensor_to_pcm_bytes(
+    audio,
+    src_sample_rate: int,
+    dst_sample_rate: int = 44100,
+) -> bytes:
+    """Convert an LTX audio output tensor to ffmpeg-ready stereo s16le PCM.
+
+    Accepts the tensor as returned by `LTX2ImageToVideoPipeline` -- shape
+    `(batch, channels, n_samples)` or `(channels, n_samples)`, dtype float in
+    [-1, 1].  Resamples to `dst_sample_rate`, forces stereo, clamps to int16,
+    and returns interleaved bytes ready to write to an s16le ffmpeg input.
+    """
+    import torch
+    import torchaudio.functional as AF
+
+    if audio is None:
+        return b""
+
+    # Drop the batch dim if present.
+    if audio.dim() == 3:
+        audio = audio[0]
+    # audio is now (channels, n_samples)
+    audio = audio.detach().to(torch.float32).cpu()
+
+    # Force stereo.
+    if audio.shape[0] == 1:
+        audio = audio.repeat(2, 1)
+    elif audio.shape[0] > 2:
+        audio = audio[:2]
+
+    # Resample if needed.
+    if src_sample_rate != dst_sample_rate:
+        audio = AF.resample(audio, src_sample_rate, dst_sample_rate)
+
+    # Clamp + convert to int16.
+    audio = audio.clamp(-1.0, 1.0)
+    pcm_int16 = (audio * 32767.0).to(torch.int16)
+
+    # Interleave channels: shape (n_samples, 2) row-major -> bytes is L,R,L,R...
+    interleaved = pcm_int16.transpose(0, 1).contiguous().numpy()
+    return interleaved.tobytes()
+
+
 def preload_files(directory: str, parallelism: int = 32) -> None:
     """Pre-read every file under `directory` in parallel into the OS page cache.
 
@@ -75,6 +117,8 @@ class RealtimeGenerator(Monitorable):
         self.pipeline_v23 = None
         self.load_local_pipeline = load_local_pipeline
         self.load_ltx23_pipeline = load_ltx23_pipeline
+        # Set after the LTX 2.3 vocoder loads; used by the audio PCM path.
+        self.audio_sample_rate: int = 24000
         
         # Performance tracking for video generation
         self.total_videos = 0
@@ -119,17 +163,6 @@ class RealtimeGenerator(Monitorable):
         self.pipeline.to("cuda")
         self.pipeline.vae.enable_tiling()
 
-        if hasattr(self.pipeline, "transformer"):
-            self.pipeline.transformer = optimize(self.pipeline.transformer)
-        elif hasattr(self.pipeline, "denoiser"):
-            self.pipeline.denoiser = optimize(self.pipeline.denoiser)
-        elif hasattr(self.pipeline, "unet"):
-            self.pipeline.unet = optimize(self.pipeline.unet)
-        elif hasattr(self.pipeline, "vae"):
-            self.pipeline.vae = optimize(self.pipeline.vae)
-        else:
-            print("No model to optimize")
-
         print("✅ ltxv1 pipeline setup complete!")
 
     def _setup_ltx23(self):
@@ -161,10 +194,19 @@ class RealtimeGenerator(Monitorable):
             checkpoint_dir, transformer=transformer, torch_dtype=torch.bfloat16
         )
         self.pipeline_v23.to("cuda")
-        self.pipeline_v23.vae.enable_tiling()
+        # VAE tiling is intentionally NOT enabled here: it chunks the spatial
+        # decode to fit small-VRAM GPUs at the cost of per-tile overhead.
+        # On GPU-B200 (192 GB HBM3e) we have plenty of headroom, so the
+        # full-tensor decode path is faster.
 
-        if hasattr(self.pipeline_v23, "transformer"):
-            self.pipeline_v23.transformer = optimize(self.pipeline_v23.transformer)
+        # Cache the vocoder output sample rate so the audio path knows what
+        # to resample from.  Standard LTX 2.3 vocoder = 24000 Hz; the
+        # bandwidth-extension vocoder = 48000 Hz.
+        try:
+            self.audio_sample_rate = int(self.pipeline_v23.vocoder.config.output_sampling_rate)
+        except AttributeError:
+            self.audio_sample_rate = 24000
+        print(f"🔊 Vocoder output sample rate: {self.audio_sample_rate} Hz")
 
         print("✅ LTX 2.3 distilled FP8 pipeline setup complete!")
     
@@ -333,12 +375,18 @@ class RealtimeGenerator(Monitorable):
 
     def generate_video_with_local_v23(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate video using local LTX 2.3 distilled FP8 pipeline"""
+        import random
         import torch
         import time
         from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
 
         if self.pipeline_v23 is None:
             raise RuntimeError("LTX 2.3 pipeline not loaded. Set LOAD_LTX23_PIPELINE=true.")
+
+        # If the caller pinned a seed, use it; otherwise pick a fresh random one
+        # each generation.  Without a per-call random seed the deterministic
+        # noise prior + chained input frame causes scene fixation.
+        seed = request.seed if request.seed is not None else random.randrange(2**31)
 
         print(f"🎬 Starting local LTX 2.3 generation - {request.num_frames} frames")
 
@@ -347,28 +395,58 @@ class RealtimeGenerator(Monitorable):
 
         print(f"📏 Resolution: {request.width}x{request.height}")
         print(f"📝 Prompt: {request.prompt[:80]}...")
+        print(f"🎚️ guidance_scale={request.guidance_scale}, stg_scale={request.stg_scale}, noise_scale={request.noise_scale}, seed={seed}")
 
         start_time = time.time()
 
+        # Build pipeline kwargs.  Only enable Spatio-Temporal Guidance when the
+        # caller asks for it AND supplies block indices -- LTX 2.3 raises if
+        # stg_scale > 0 without a block list, and we don't want to guess the
+        # right indices for an arbitrary model checkpoint.
+        pipeline_kwargs = dict(
+            image=input_image,
+            prompt=request.prompt,
+            negative_prompt=request.negative_prompt,
+            width=request.width,
+            height=request.height,
+            num_frames=request.num_frames,
+            num_inference_steps=8,
+            sigmas=DISTILLED_SIGMA_VALUES,
+            guidance_scale=request.guidance_scale,
+            noise_scale=request.noise_scale,
+            modality_scale=1.0,
+            generator=torch.Generator(device="cuda").manual_seed(seed),
+            output_type="pil",
+            return_dict=False,
+        )
+
+        stg_blocks = getattr(request, "spatio_temporal_guidance_blocks", None)
+        if request.stg_scale and request.stg_scale > 0 and stg_blocks:
+            pipeline_kwargs["stg_scale"] = request.stg_scale
+            pipeline_kwargs["spatio_temporal_guidance_blocks"] = stg_blocks
+            print(f"🌀 STG enabled: stg_scale={request.stg_scale}, blocks={stg_blocks}")
+        elif request.stg_scale and request.stg_scale > 0:
+            print(f"⚠️ stg_scale={request.stg_scale} requested but no spatio_temporal_guidance_blocks supplied; STG disabled")
+
         try:
-            video, audio = self.pipeline_v23(
-                image=input_image,
-                prompt=request.prompt,
-                negative_prompt=request.negative_prompt,
-                width=request.width,
-                height=request.height,
-                num_frames=request.num_frames,
-                num_inference_steps=8,
-                sigmas=DISTILLED_SIGMA_VALUES,
-                guidance_scale=1.0,
-                stg_scale=0.0,
-                modality_scale=1.0,
-                generator=torch.Generator(device="cuda").manual_seed(0),
-                output_type="pil",
-                return_dict=False,
-            )
+            video, audio = self.pipeline_v23(**pipeline_kwargs)
 
             frames = video[0]
+
+            # Convert audio waveform to ffmpeg-ready PCM bytes.  Done here on
+            # the GPU thread so the cost is overlapped with the next prompt
+            # generation rather than blocking the event loop.
+            try:
+                audio_pcm = audio_tensor_to_pcm_bytes(
+                    audio,
+                    src_sample_rate=self.audio_sample_rate,
+                    dst_sample_rate=44100,
+                )
+                audio_seconds = len(audio_pcm) / (44100 * 2 * 2)  # 2ch * 2 bytes
+                print(f"🔊 Audio PCM ready: {len(audio_pcm)} bytes ({audio_seconds:.2f}s @ 44.1kHz stereo)")
+            except Exception as e:
+                print(f"⚠️ Failed to convert audio to PCM (continuing without audio): {e}")
+                audio_pcm = None
 
             self.last_generation_time = time.time() - start_time
             self.total_generation_time += self.last_generation_time
@@ -379,7 +457,7 @@ class RealtimeGenerator(Monitorable):
             print(f"❌ LTX 2.3 local generation failed: {e}")
             raise
 
-        return LTXVideoResponseWithFrames(frames=frames)
+        return LTXVideoResponseWithFrames(frames=frames, audio_pcm=audio_pcm)
     
     def generate_video_with_local_pipeline(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate video using local HuggingFace LTX pipeline (ltxv1)"""

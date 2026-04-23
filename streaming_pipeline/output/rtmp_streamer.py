@@ -1,4 +1,6 @@
 import ffmpeg
+import os
+import tempfile
 import threading
 import time
 import numpy as np
@@ -8,26 +10,44 @@ import cv2
 from streaming_pipeline.utils.logger_config import queue_log
 from streaming_pipeline.models import Monitorable
 
+
+# Audio output is fixed at stereo s16le @ 44.1 kHz (Twitch ingest spec).
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_CHANNELS = 2
+AUDIO_BYTES_PER_SAMPLE = 2  # int16
+AUDIO_BYTES_PER_SECOND = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE
+
+
 class FFmpegRTMPStreamer(Monitorable):
-    def __init__(self, stream_key: str, fps: int = 24, width: int = 640, height: int = 480):
+    def __init__(self, stream_key: str, fps: int = 24, width: int = 640, height: int = 480, enable_audio: bool = False):
         self.stream_key = stream_key
         self.fps = fps
         self.width = width
         self.height = height
+        self.enable_audio = enable_audio
         # Fix: Use correct Twitch RTMP path
         self.rtmp_url = f"rtmp://live.twitch.tv/app/{stream_key}"
-        
+
         # Stream state
         self.is_streaming = False
         self.ffmpeg_process = None
         self.stream_thread = None
         self.monitor_thread = None
-        
+
         # Frame management - Optimized buffer size
         self.frame_queue = Queue(maxsize=1000)  # ~9 seconds at 16fps
-        
-        
-                # Statistics - ADD MISSING VARIABLES
+
+        # Audio plumbing (only used when enable_audio=True)
+        self.audio_queue: "Queue[bytes]" = Queue(maxsize=64)  # ~64 clips of audio
+        self.audio_thread: threading.Thread | None = None
+        self.audio_fifo_path: str | None = None
+        self.audio_fifo_fd: int | None = None
+        # Bytes streamed; used to throttle silence injection so we don't
+        # outpace ffmpeg's audio decoder when the queue is empty.
+        self.audio_bytes_written = 0
+        self.audio_start_time: float | None = None
+
+        # Statistics
         self.frames_sent = 0
         self.frames_dropped = 0
         self.frames_added_total = 0
@@ -45,9 +65,9 @@ class FFmpegRTMPStreamer(Monitorable):
             print(f"🔗 Starting FFmpeg RTMP stream to Twitch...")
             print(f"   Resolution: {self.width}x{self.height}")
             print(f"   FPS: {self.fps}")
+            print(f"   Audio: {'native (LTX 2.3 vocoder)' if self.enable_audio else 'silent (anullsrc)'}")
             print(f"   RTMP URL: {self.rtmp_url[:50]}...")
-            
-            # Fix: Create proper video and audio inputs
+
             video_in = ffmpeg.input(
                 'pipe:',
                 format='rawvideo',
@@ -56,11 +76,27 @@ class FFmpegRTMPStreamer(Monitorable):
                 framerate=self.fps,  # Use 'framerate' instead of 'r' for raw pipe
             )
 
-            # Fix: Add silent audio so Twitch doesn't drop the stream
-            audio_in = ffmpeg.input(
-                'anullsrc=channel_layout=stereo:sample_rate=44100',
-                f='lavfi'
-            )
+            # Build the audio input: native PCM via FIFO if enabled, else silent.
+            if self.enable_audio:
+                # Create a FIFO that ffmpeg will read PCM from.  We open it for
+                # writing in a background thread *after* spawning ffmpeg, so
+                # that ffmpeg has opened it for reading first (otherwise the
+                # writer-side open() will block forever).
+                fifo_dir = tempfile.mkdtemp(prefix="ltx_audio_")
+                self.audio_fifo_path = os.path.join(fifo_dir, "audio.pcm")
+                os.mkfifo(self.audio_fifo_path)
+                queue_log.info(f"🔊 Created audio FIFO at {self.audio_fifo_path}")
+                audio_in = ffmpeg.input(
+                    self.audio_fifo_path,
+                    format='s16le',
+                    ar=AUDIO_SAMPLE_RATE,
+                    ac=AUDIO_CHANNELS,
+                )
+            else:
+                audio_in = ffmpeg.input(
+                    'anullsrc=channel_layout=stereo:sample_rate=44100',
+                    f='lavfi',
+                )
 
             self.ffmpeg_process = (
                 ffmpeg
@@ -68,12 +104,12 @@ class FFmpegRTMPStreamer(Monitorable):
                     video_in, audio_in, self.rtmp_url,
                     vcodec='libx264',
                     pix_fmt='yuv420p',
-                    preset='faster',               # Changed from 'veryfast' to 'faster' for better quality
+                    preset='faster',
                     tune='zerolatency',
-                    g=self.fps,                    # 1s keyframe interval (reduced from 2s)
-                    maxrate='1500k',               # Reduced bitrate from 2500k to 1500k
-                    bufsize='3000k',               # Reduced buffer from 10000k to 3000k
-                    **{'b:v': '1500k'},            # Reduced video bitrate
+                    g=self.fps,
+                    maxrate='1500k',
+                    bufsize='3000k',
+                    **{'b:v': '1500k'},
                     acodec='aac',
                     **{'b:a': '128k'},
                     ar='44100',
@@ -85,32 +121,38 @@ class FFmpegRTMPStreamer(Monitorable):
                 .overwrite_output()
                 .run_async(pipe_stdin=True, pipe_stderr=True)
             )
-            
+
             self.is_streaming = True
             self.start_time = time.time()
-            
+
             # Start the streaming loop
             queue_log.info("📺 Starting continuous frame streaming loop...")
             self.stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
             self.stream_thread.start()
-            
-            
+
+            # Start the audio loop if native audio is enabled.
+            if self.enable_audio:
+                self.audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
+                self.audio_thread.start()
+                queue_log.info("🔊 Audio FIFO writer thread started")
+
             queue_log.info(f"✅ FFmpeg RTMP stream started - NOW LIVE ON TWITCH!")
             queue_log.info(f"🔗 RTMP URL: {self.rtmp_url}")
             queue_log.info(f"📐 Resolution: {self.width}x{self.height} @ {self.fps}fps")
-            
+
         except Exception as e:
             queue_log.error(f"❌ Failed to start FFmpeg RTMP stream: {e}")
             self.is_streaming = False
+            self._cleanup_audio_fifo()
 
     def stop_stream(self):
         """Stop FFmpeg RTMP stream"""
         if not self.is_streaming:
             return
-        
+
         print("🛑 Stopping FFmpeg RTMP stream...")
         self.is_streaming = False
-        
+
         # Close FFmpeg process
         if self.ffmpeg_process:
             try:
@@ -119,10 +161,32 @@ class FFmpegRTMPStreamer(Monitorable):
             except:
                 self.ffmpeg_process.kill()
             self.ffmpeg_process = None
-        
+
+        # Tear down the audio FIFO + writer fd.
+        self._cleanup_audio_fifo()
+
         # Clear queue and reset metrics when stopped
         self._reset_metrics()
         print("✅ FFmpeg RTMP stream stopped")
+
+    def _cleanup_audio_fifo(self):
+        """Close the audio FIFO writer fd and remove the temp file."""
+        if self.audio_fifo_fd is not None:
+            try:
+                os.close(self.audio_fifo_fd)
+            except OSError:
+                pass
+            self.audio_fifo_fd = None
+        if self.audio_fifo_path:
+            try:
+                os.unlink(self.audio_fifo_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(os.path.dirname(self.audio_fifo_path))
+            except OSError:
+                pass
+            self.audio_fifo_path = None
 
     def _reset_metrics(self):
         """Reset all metrics and clear queue when stream stops"""
@@ -132,15 +196,96 @@ class FFmpegRTMPStreamer(Monitorable):
                 self.frame_queue.get_nowait()
             except:
                 break
-        
+
+        # Clear the audio queue too.
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except:
+                break
+
         # Reset counters
         self.frames_sent = 0
         self.frames_dropped = 0
         self.frames_added_total = 0
         self.frames_added_last_second = 0
         self.frames_dropped_last_second = 0
+        self.audio_bytes_written = 0
+        self.audio_start_time = None
         self.start_time = None
         print("🧹 RTMP metrics and queue cleared")
+
+    def add_audio_chunk(self, pcm_bytes: bytes) -> None:
+        """Enqueue stereo s16le @ 44.1 kHz PCM bytes for streaming.
+
+        Safe to call when audio is disabled -- it just becomes a no-op.
+        """
+        if not self.enable_audio or not pcm_bytes:
+            return
+        if not self.is_streaming:
+            return
+        try:
+            self.audio_queue.put_nowait(pcm_bytes)
+            queue_log.info(f"🔊 Queued audio chunk: {len(pcm_bytes)} bytes ({len(pcm_bytes) / AUDIO_BYTES_PER_SECOND:.2f}s)")
+        except Exception as e:
+            queue_log.warning(f"⚠️ Failed to enqueue audio chunk: {e}")
+
+    def _audio_loop(self):
+        """Background thread that writes audio PCM to the FIFO at real-time rate.
+
+        Opens the FIFO for writing (blocks until ffmpeg opens the read end),
+        then drains audio_queue and pads with silence to keep ffmpeg's audio
+        decoder fed at 44100 stereo samples/sec.  If we ever fall behind we
+        let ffmpeg's PTS handling sort it out -- it's better to overshoot
+        slightly than to underrun and stall the whole pipeline.
+        """
+        try:
+            # Blocking open: returns once ffmpeg has opened the FIFO for reading.
+            queue_log.info(f"🔊 Opening audio FIFO for writing: {self.audio_fifo_path}")
+            self.audio_fifo_fd = os.open(self.audio_fifo_path, os.O_WRONLY)
+            queue_log.info(f"🔊 Audio FIFO writer connected; streaming PCM at {AUDIO_SAMPLE_RATE} Hz stereo")
+        except Exception as e:
+            queue_log.error(f"❌ Could not open audio FIFO writer: {e}")
+            return
+
+        # Pace silence padding so we don't write faster than wall-clock.
+        # When the queue has data we write as fast as we can (ffmpeg buffers).
+        silence_chunk_seconds = 0.1
+        silence_chunk = b"\x00" * int(AUDIO_BYTES_PER_SECOND * silence_chunk_seconds)
+        self.audio_start_time = time.time()
+
+        while self.is_streaming:
+            try:
+                try:
+                    pcm = self.audio_queue.get(timeout=0.05)
+                    os.write(self.audio_fifo_fd, pcm)
+                    self.audio_bytes_written += len(pcm)
+                    continue
+                except Empty:
+                    pass
+
+                # Underrun: pad with silence, but only if we've fallen behind
+                # wall clock.  This keeps ffmpeg's audio decoder fed without
+                # spamming gigabytes when generation is comfortably ahead.
+                wall_seconds = time.time() - self.audio_start_time
+                target_bytes = int(wall_seconds * AUDIO_BYTES_PER_SECOND)
+                if self.audio_bytes_written < target_bytes:
+                    deficit_bytes = target_bytes - self.audio_bytes_written
+                    chunk = silence_chunk if deficit_bytes >= len(silence_chunk) else b"\x00" * deficit_bytes
+                    os.write(self.audio_fifo_fd, chunk)
+                    self.audio_bytes_written += len(chunk)
+                else:
+                    # Comfortably ahead -- just sleep a bit.
+                    time.sleep(0.01)
+
+            except (BrokenPipeError, OSError) as e:
+                queue_log.error(f"❌ Audio FIFO write failed (ffmpeg likely exited): {e}")
+                break
+            except Exception as e:
+                queue_log.error(f"❌ Audio loop error: {e}")
+                time.sleep(0.05)
+
+        queue_log.info("🔊 Audio loop ended")
 
     
 

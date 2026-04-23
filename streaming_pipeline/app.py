@@ -17,6 +17,7 @@ requirements = [
     "https://download.pytorch.org/whl/cu128",
     "torch==2.7.1+cu128",
     "torchvision==0.22.1+cu128",
+    "torchaudio==2.7.1+cu128",  # Used to resample LTX 2.3 vocoder output for native audio streaming
     "git+https://github.com/huggingface/diffusers.git@main",
     "transformers>=4.47.2,<4.52.0",
     "sentencepiece>=0.1.96",
@@ -55,7 +56,7 @@ class RealtimeStreamingApp(
     def setup(self):
         """Setup with monitoring"""
         print(" Setting up complete streaming pipeline...")
-        
+        print('testing')
         # Initialize the shared streaming service
         self.streaming_service = StreamingService()
         self.streaming_service.setup()

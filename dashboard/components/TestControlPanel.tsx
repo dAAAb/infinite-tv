@@ -10,8 +10,35 @@ interface TestControlPanelProps {
   isStreaming: boolean
 }
 
+// Resolution presets for the streaming output.  All dimensions are divisible
+// by 32 (LTX requirement).  Ordered roughly by speed (smallest first) within
+// each aspect ratio group.
+type Preset = { label: string; width: number; height: number }
+const RESOLUTION_PRESETS: Preset[] = [
+  { label: '384x256  (3:2, fastest)',  width: 384, height: 256 },
+  { label: '512x288  (16:9, fast)',    width: 512, height: 288 },
+  { label: '512x384  (4:3, fast)',     width: 512, height: 384 },
+  { label: '640x384  (5:3)',           width: 640, height: 384 },
+  { label: '640x480  (4:3)',           width: 640, height: 480 },
+  { label: '768x432  (16:9)',          width: 768, height: 432 },
+  { label: '768x512  (3:2)',           width: 768, height: 512 },
+  { label: '512x512  (1:1)',           width: 512, height: 512 },
+  { label: '288x512  (9:16, vertical)', width: 288, height: 512 },
+  { label: '432x768  (9:16, vertical)', width: 432, height: 768 },
+]
+
+const PRESET_CUSTOM = 'custom'
+
+function findPresetKey(width: number, height: number): string {
+  const match = RESOLUTION_PRESETS.find(p => p.width === width && p.height === height)
+  return match ? `${match.width}x${match.height}` : PRESET_CUSTOM
+}
+
 export default function TestControlPanel({ onStartTest, onStopTest, isStreaming }: TestControlPanelProps) {
-  const [selectedModel, setSelectedModel] = useState<ModelType>('ltxv1')
+  // Default to ltx-2.3-local because the backend's default LOAD_LTX23_PIPELINE=true
+  // only loads that pipeline.  Selecting ltxv1 here without setting
+  // LOAD_LOCAL_PIPELINE=true on the backend will hit "Pipeline not loaded".
+  const [selectedModel, setSelectedModel] = useState<ModelType>('ltx-2.3-local')
   
   const [ltxv1Config, setLtxv1Config] = useState<LTXv1Config>({
     model: 'ltxv1',
@@ -45,12 +72,22 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
     model: 'ltx-2.3-local',
     initial_prompt: "A cinematic video with smooth camera movement and realistic motion",
     initial_image_url: "https://storage.googleapis.com/remade-v2/uploads/a185f836a3e9ca84cc75f5c12bb10dd4.jpg",
-    negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted",
-    height: 512,
-    width: 768,
+    negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted, static scene, frozen frame, no motion, repetitive, looping",
+    height: 384,
+    width: 512,
     num_frames: 121,
     target_fps: 14.0,
-    mode: 'regular'
+    mode: 'regular',
+    // Fixation-control defaults (mirror backend api.py defaults).
+    // STG defaults to OFF because it requires spatio_temporal_guidance_blocks
+    // which depend on the model architecture; enable from Advanced if you
+    // know the right block indices for your checkpoint.
+    guidance_scale: 3.0,
+    stg_scale: 0.0,
+    spatio_temporal_guidance_blocks: null,
+    noise_scale: 0.15,
+    seed: null,
+    enable_audio: false,
   })
 
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -449,78 +486,106 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
         {/* Streaming Parameters - Both Models */}
         <div>
           <label className="metric-label mb-3 block">Streaming Parameters</label>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-            <div>
-              <label className="metric-label mb-2 block text-xs">Target FPS</label>
-              <input
-                type="number"
-                value={selectedModel === 'ltxv1' ? ltxv1Config.target_fps : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.target_fps : ltxv2Config.target_fps}
-                onChange={(e) => {
-                  const value = parseFloat(e.target.value)
-                  if (selectedModel === 'ltxv1') {
-                    setLtxv1Config(prev => ({ ...prev, target_fps: value }))
-                  } else if (selectedModel === 'ltx-2.3-local') {
-                    setLtx23LocalConfig(prev => ({ ...prev, target_fps: value }))
-                  } else {
-                    setLtxv2Config(prev => ({ ...prev, target_fps: value }))
-                  }
-                }}
-                className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
-                min={1}
-                max={30}
-                step={0.5}
-              />
-            </div>
-            
-            <div>
-              <label className="metric-label mb-2 block text-xs">Stream Width</label>
-              <input
-                type="number"
-                value={selectedModel === 'ltxv1' ? ltxv1Config.width : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.width : ltxv2Config.width}
-                onChange={(e) => {
-                  const value = parseInt(e.target.value)
-                  if (selectedModel === 'ltxv1') {
-                    setLtxv1Config(prev => ({ ...prev, width: value }))
-                  } else if (selectedModel === 'ltx-2.3-local') {
-                    setLtx23LocalConfig(prev => ({ ...prev, width: value }))
-                  } else {
-                    setLtxv2Config(prev => ({ ...prev, width: value }))
-                  }
-                }}
-                className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
-                min={256}
-                max={1920}
-                step={32}
-              />
-            </div>
-            
-            <div>
-              <label className="metric-label mb-2 block text-xs">Stream Height</label>
-              <input
-                type="number"
-                value={selectedModel === 'ltxv1' ? ltxv1Config.height : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.height : ltxv2Config.height}
-                onChange={(e) => {
-                  const value = parseInt(e.target.value)
-                  if (selectedModel === 'ltxv1') {
-                    setLtxv1Config(prev => ({ ...prev, height: value }))
-                  } else if (selectedModel === 'ltx-2.3-local') {
-                    setLtx23LocalConfig(prev => ({ ...prev, height: value }))
-                  } else {
-                    setLtxv2Config(prev => ({ ...prev, height: value }))
-                  }
-                }}
-                className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
-                min={256}
-                max={1080}
-                step={32}
-              />
-            </div>
-          </div>
-          <p className="text-xs text-fal-gray-600 mt-2">
-            {selectedModel === 'ltx-2.3'
-              ? 'Stream resolution: Videos are resized from LTX 2.3 API output to these dimensions for streaming'
-              : 'Generation and streaming resolution (must be divisible by 32)'}
-          </p>
+          {(() => {
+            const currentWidth = selectedModel === 'ltxv1' ? ltxv1Config.width : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.width : ltxv2Config.width
+            const currentHeight = selectedModel === 'ltxv1' ? ltxv1Config.height : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.height : ltxv2Config.height
+            const currentPresetKey = findPresetKey(currentWidth, currentHeight)
+            const isCustom = currentPresetKey === PRESET_CUSTOM
+
+            const setDimensions = (w: number, h: number) => {
+              if (selectedModel === 'ltxv1') {
+                setLtxv1Config(prev => ({ ...prev, width: w, height: h }))
+              } else if (selectedModel === 'ltx-2.3-local') {
+                setLtx23LocalConfig(prev => ({ ...prev, width: w, height: h }))
+              } else {
+                setLtxv2Config(prev => ({ ...prev, width: w, height: h }))
+              }
+            }
+
+            return (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="metric-label mb-2 block text-xs">Target FPS</label>
+                    <input
+                      type="number"
+                      value={selectedModel === 'ltxv1' ? ltxv1Config.target_fps : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.target_fps : ltxv2Config.target_fps}
+                      onChange={(e) => {
+                        const value = parseFloat(e.target.value)
+                        if (selectedModel === 'ltxv1') {
+                          setLtxv1Config(prev => ({ ...prev, target_fps: value }))
+                        } else if (selectedModel === 'ltx-2.3-local') {
+                          setLtx23LocalConfig(prev => ({ ...prev, target_fps: value }))
+                        } else {
+                          setLtxv2Config(prev => ({ ...prev, target_fps: value }))
+                        }
+                      }}
+                      className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                      min={1}
+                      max={30}
+                      step={0.5}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="metric-label mb-2 block text-xs">Stream Resolution</label>
+                    <select
+                      value={currentPresetKey}
+                      onChange={(e) => {
+                        const key = e.target.value
+                        if (key === PRESET_CUSTOM) return
+                        const preset = RESOLUTION_PRESETS.find(p => `${p.width}x${p.height}` === key)
+                        if (preset) setDimensions(preset.width, preset.height)
+                      }}
+                      className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                    >
+                      {RESOLUTION_PRESETS.map(p => (
+                        <option key={`${p.width}x${p.height}`} value={`${p.width}x${p.height}`}>
+                          {p.label}
+                        </option>
+                      ))}
+                      <option value={PRESET_CUSTOM}>Custom ({currentWidth}x{currentHeight})</option>
+                    </select>
+                  </div>
+                </div>
+
+                {isCustom && (
+                  <div className="grid grid-cols-2 gap-4 mt-3">
+                    <div>
+                      <label className="metric-label mb-2 block text-xs">Custom Width</label>
+                      <input
+                        type="number"
+                        value={currentWidth}
+                        onChange={(e) => setDimensions(parseInt(e.target.value), currentHeight)}
+                        className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                        min={256}
+                        max={1920}
+                        step={32}
+                      />
+                    </div>
+                    <div>
+                      <label className="metric-label mb-2 block text-xs">Custom Height</label>
+                      <input
+                        type="number"
+                        value={currentHeight}
+                        onChange={(e) => setDimensions(currentWidth, parseInt(e.target.value))}
+                        className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                        min={256}
+                        max={1920}
+                        step={32}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <p className="text-xs text-fal-gray-600 mt-2">
+                  {selectedModel === 'ltx-2.3'
+                    ? 'Stream resolution: videos from the remote LTX 2.3 API are resized to these dimensions before streaming.'
+                    : 'Generation and streaming resolution. Must be divisible by 32 (all presets are).'}
+                </p>
+              </>
+            )
+          })()}
         </div>
 
         {/* LTXv1-specific Parameters */}
@@ -591,6 +656,153 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
             </div>
 
 
+          </div>
+        )}
+
+        {/* Advanced Parameters - LTX 2.3 Local (fixation-control knobs) */}
+        {showAdvanced && selectedModel === 'ltx-2.3-local' && (
+          <div className="space-y-4 border-t border-fal-gray-700 pt-6">
+            <h4 className="text-fal-gray-900 font-medium">Advanced LTX 2.3 Local Parameters</h4>
+            <p className="text-xs text-fal-gray-600">
+              Tune these to fight scene fixation. Higher <code>guidance_scale</code> makes
+              the prompt matter more; <code>noise_scale</code> injects entropy into the
+              latents; leave seed empty for a fresh random seed every generation
+              (recommended). <code>stg_scale</code> adds motion variety but also requires
+              non-empty <code>STG blocks</code> (transformer indices) -- if you do not know
+              the right indices for the checkpoint, leave both at 0 and the request will
+              skip STG safely.
+            </p>
+
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+              <div>
+                <label className="metric-label mb-2 block text-xs">Frames (8k+1)</label>
+                <input
+                  type="number"
+                  value={ltx23LocalConfig.num_frames}
+                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, num_frames: parseInt(e.target.value) }))}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                  min={9}
+                  max={241}
+                  step={8}
+                />
+              </div>
+
+              <div>
+                <label className="metric-label mb-2 block text-xs">guidance_scale</label>
+                <input
+                  type="number"
+                  value={ltx23LocalConfig.guidance_scale}
+                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, guidance_scale: parseFloat(e.target.value) }))}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                  min={1}
+                  max={7}
+                  step={0.1}
+                />
+              </div>
+
+              <div>
+                <label className="metric-label mb-2 block text-xs">stg_scale</label>
+                <input
+                  type="number"
+                  value={ltx23LocalConfig.stg_scale}
+                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, stg_scale: parseFloat(e.target.value) }))}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                  min={0}
+                  max={3}
+                  step={0.1}
+                />
+              </div>
+
+              <div>
+                <label className="metric-label mb-2 block text-xs">STG blocks (csv)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. 19 or 14,18,22"
+                  value={(ltx23LocalConfig.spatio_temporal_guidance_blocks ?? []).join(',')}
+                  onChange={(e) => {
+                    const raw = e.target.value.trim()
+                    if (!raw) {
+                      setLtx23LocalConfig(prev => ({ ...prev, spatio_temporal_guidance_blocks: null }))
+                      return
+                    }
+                    const blocks = raw.split(',')
+                      .map(s => parseInt(s.trim()))
+                      .filter(n => !isNaN(n) && n >= 0)
+                    setLtx23LocalConfig(prev => ({ ...prev, spatio_temporal_guidance_blocks: blocks.length ? blocks : null }))
+                  }}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="metric-label mb-2 block text-xs">noise_scale</label>
+                <input
+                  type="number"
+                  value={ltx23LocalConfig.noise_scale}
+                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, noise_scale: parseFloat(e.target.value) }))}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                  min={0}
+                  max={0.3}
+                  step={0.01}
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="metric-label mb-2 block text-xs">Seed</label>
+                <div className="flex items-center space-x-3">
+                  <input
+                    type="number"
+                    value={ltx23LocalConfig.seed ?? ''}
+                    placeholder="random"
+                    disabled={ltx23LocalConfig.seed === null}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setLtx23LocalConfig(prev => ({ ...prev, seed: v === '' ? null : parseInt(v) }))
+                    }}
+                    className="flex-1 bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono disabled:opacity-50"
+                    min={0}
+                    step={1}
+                  />
+                  <label className="flex items-center space-x-2 text-xs text-fal-gray-700 select-none">
+                    <input
+                      type="checkbox"
+                      checked={ltx23LocalConfig.seed === null}
+                      onChange={(e) => {
+                        setLtx23LocalConfig(prev => ({ ...prev, seed: e.target.checked ? null : 0 }))
+                      }}
+                    />
+                    <span>Random per generation</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="metric-label mb-2 block text-xs">Negative Prompt</label>
+              <textarea
+                value={ltx23LocalConfig.negative_prompt}
+                onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, negative_prompt: e.target.value }))}
+                className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono text-sm"
+                rows={2}
+              />
+            </div>
+
+            <div>
+              <label className="flex items-center space-x-2 select-none cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={ltx23LocalConfig.enable_audio}
+                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, enable_audio: e.target.checked }))}
+                />
+                <span className="text-sm text-fal-gray-900 font-medium">Stream native audio (experimental)</span>
+              </label>
+              <p className="text-xs text-fal-gray-600 mt-1 ml-6">
+                LTX 2.3 jointly generates audio with video. When off, the stream uses
+                silent <code>anullsrc</code> like before. When on, the model's PCM
+                output is fed into ffmpeg via a FIFO. The stream must be restarted
+                for this toggle to take effect.
+              </p>
+            </div>
           </div>
         )}
 

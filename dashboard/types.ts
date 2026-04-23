@@ -136,6 +136,17 @@ export interface LTX23LocalConfig {
   num_frames: number
   target_fps: number
   mode: 'regular' | 'nightmare'
+  // Fixation-control parameters (see streaming_pipeline/models/api.py)
+  guidance_scale: number
+  stg_scale: number
+  // Required when stg_scale > 0; transformer block indices to apply STG at.
+  // null/empty = STG disabled even if stg_scale > 0 (server skips it safely).
+  spatio_temporal_guidance_blocks: number[] | null
+  noise_scale: number
+  // null = random seed per generation; number = pinned seed
+  seed: number | null
+  // Stream LTX 2.3's natively-generated audio instead of silent anullsrc
+  enable_audio: boolean
 }
 
 export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig
