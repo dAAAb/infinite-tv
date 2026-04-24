@@ -34,6 +34,13 @@ class TextOverlay(Monitorable):
         # Font cache keyed by pixel size so we don't reload TTF on every frame.
         self._font_cache: Dict[int, Any] = {}
 
+        # Pre-rendered overlay bitmap cache.  Rebuilt only when the text or
+        # the target frame size changes, so per-frame work drops from ~9
+        # truetype rasterizations to a single alpha paste.
+        self._overlay_cache: Optional[Image.Image] = None
+        self._overlay_y: int = 0
+        self._cache_key: Optional[tuple] = None  # (text, frame_w, frame_h)
+
         # Performance tracking for monitoring
         self.total_frames_processed = 0
         self.total_processing_time = 0.0
@@ -46,6 +53,7 @@ class TextOverlay(Monitorable):
             self.current_text = f"@{username}: {comment_text}" if username else comment_text
         else:
             self.current_text = None
+        self._invalidate_cache()
 
     def set_prompt(self, prompt_text: str):
         """Set AI prompt to overlay on frames"""
@@ -53,6 +61,12 @@ class TextOverlay(Monitorable):
             self.current_text = f"AI: {prompt_text}"
         else:
             self.current_text = None
+        self._invalidate_cache()
+
+    def _invalidate_cache(self):
+        """Drop the cached overlay bitmap; the next frame will rebuild it."""
+        self._overlay_cache = None
+        self._cache_key = None
 
     def _get_font(self, font_size: int):
         """Return a cached truetype font at the given pixel size."""
@@ -75,40 +89,133 @@ class TextOverlay(Monitorable):
             self._font_cache[font_size] = None
             return None
 
+    @staticmethod
+    def _text_pixel_width(font, text: str) -> int:
+        """Measure the pixel width of `text` rendered with `font`.
+
+        Uses Pillow's modern API (`getlength`) when available; falls back to
+        `getbbox` and finally to character-count estimation for the default
+        bitmap font (which exposes neither).
+        """
+        try:
+            return int(font.getlength(text))
+        except (AttributeError, TypeError):
+            pass
+        try:
+            l, _, r, _ = font.getbbox(text)
+            return int(r - l)
+        except (AttributeError, TypeError):
+            return len(text) * 6  # crude fallback for bitmap default font
+
+    def _wrap_text_to_width(self, text: str, font, max_width: int) -> list[str]:
+        """Greedy word-wrap `text` so each line fits within `max_width` pixels.
+
+        Words longer than `max_width` are placed on their own line and clipped
+        by the renderer; the alternative (mid-word break) tends to produce
+        worse-looking output for chat overlays.
+        """
+        words = text.split()
+        if not words:
+            return [text]
+
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if self._text_pixel_width(font, candidate) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    def _build_overlay(self, text: str, frame_w: int, frame_h: int):
+        """Render the text + outline into a small RGBA bitmap once.
+
+        Returns (overlay_image, paste_y).  The overlay bitmap is sized to fit
+        as many wrapped lines as `text` requires, capped to `frame_h // 2`.
+        """
+        # Initial sizing: ~5% of frame width, clamped to a usable range.
+        font_size = max(12, min(48, frame_w // 20))
+        padding = max(6, frame_w // 40)
+        max_text_width = max(1, frame_w - 2 * padding)
+
+        # If even the longest single word doesn't fit, shrink the font until
+        # it does (down to a 10px floor).  This prevents the rendered text
+        # from spilling past the right edge on very narrow frames.
+        font = self._get_font(font_size)
+        longest_word = max(text.split() or [text], key=len)
+        while font_size > 10 and self._text_pixel_width(font, longest_word) > max_text_width:
+            font_size -= 1
+            font = self._get_font(font_size)
+
+        # Word-wrap the (possibly shrunk) text and compute layout.
+        lines = self._wrap_text_to_width(text, font, max_text_width)
+        line_height = int(font_size * 1.2)
+        text_block_h = line_height * len(lines)
+
+        # Cap the overlay at half the frame height so it never covers the
+        # whole picture if the user pastes a paragraph.
+        max_overlay_h = max(line_height + 2 * padding, frame_h // 2)
+        overlay_h = min(text_block_h + 2 * padding, max_overlay_h)
+        # If we capped, drop the trailing lines that no longer fit (visual
+        # truncation; keeps the overlay readable instead of overflowing).
+        max_lines = max(1, (overlay_h - 2 * padding) // line_height)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            text_block_h = line_height * len(lines)
+            overlay_h = text_block_h + 2 * padding
+
+        # Sit the text just inside the bottom edge.
+        paste_y = max(0, frame_h - overlay_h)
+
+        overlay = Image.new("RGBA", (frame_w, overlay_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        # Render each wrapped line.  Single PIL call per line with native
+        # 1-pixel outline (Pillow >= 8.0); falls back to a manual 8-pass
+        # outline if the build is older.
+        for i, line in enumerate(lines):
+            ly = padding + i * line_height
+            try:
+                draw.text(
+                    (padding, ly),
+                    line,
+                    font=font,
+                    fill=(255, 255, 255, 255),
+                    stroke_width=1,
+                    stroke_fill=(0, 0, 0, 255),
+                )
+            except TypeError:
+                for adj_x in (-1, 0, 1):
+                    for adj_y in (-1, 0, 1):
+                        if adj_x or adj_y:
+                            draw.text((padding + adj_x, ly + adj_y), line, font=font, fill=(0, 0, 0, 255))
+                draw.text((padding, ly), line, font=font, fill=(255, 255, 255, 255))
+
+        return overlay, paste_y
+
     def apply_overlay(self, frame: Image.Image) -> Image.Image:
-        """Apply text overlay to frame; scales font + position to actual frame size."""
+        """Apply text overlay to frame.  Mutates `frame` in place and returns it.
+
+        Uses a cached overlay bitmap keyed by (text, frame_w, frame_h), so the
+        truetype rasterization happens once per text-change, not per frame.
+        """
         if not self.current_text:
             return frame
 
         frame_w, frame_h = frame.size
+        key = (self.current_text, frame_w, frame_h)
+        if key != self._cache_key or self._overlay_cache is None:
+            self._overlay_cache, self._overlay_y = self._build_overlay(self.current_text, frame_w, frame_h)
+            self._cache_key = key
 
-        # Scale font and padding off the actual frame so smaller resolutions
-        # still produce a visible, on-screen overlay.
-        # ~5% of frame width, clamped to a usable range.
-        font_size = max(12, min(48, frame_w // 20))
-        padding = max(6, frame_w // 40)
-        # Rough text height estimate (truetype line height ~= 1.2 * point size).
-        text_block_h = int(font_size * 1.2)
-
-        text_x = padding
-        # Sit the text just inside the bottom edge.
-        text_y = max(0, frame_h - text_block_h - padding)
-
-        font = self._get_font(font_size)
-
-        overlay_frame = frame.copy()
-        draw = ImageDraw.Draw(overlay_frame)
-
-        # Black 1-pixel outline for readability over any background.
-        for adj_x in (-1, 0, 1):
-            for adj_y in (-1, 0, 1):
-                if adj_x or adj_y:
-                    draw.text((text_x + adj_x, text_y + adj_y), self.current_text, font=font, fill=(0, 0, 0))
-
-        # White fill on top.
-        draw.text((text_x, text_y), self.current_text, font=font, fill=(255, 255, 255))
-
-        return overlay_frame
+        # Alpha-paste the cached overlay onto the frame in place.  No copy:
+        # the caller (RealtimeVideoStreamer) owns these frames and discards
+        # them after streaming, so mutation is safe.
+        frame.paste(self._overlay_cache, (0, self._overlay_y), self._overlay_cache)
+        return frame
     
     def apply_overlay_batch(self, frames: List[Image.Image]) -> List[Image.Image]:
         """Apply overlay to multiple frames with performance tracking"""
@@ -137,7 +244,8 @@ class TextOverlay(Monitorable):
         self.last_batch_size = 0
         self.last_batch_time = 0.0
         self.current_text = None  # Clear overlay text too
-        # Keep cached_font - no need to reload it
+        self._invalidate_cache()  # Drop the rendered overlay bitmap as well
+        # Keep _font_cache - no need to reload TTF
         print("🧹 Text overlay metrics reset")
     
     def get_status(self) -> Dict[str, Any]:
