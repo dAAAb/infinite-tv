@@ -147,6 +147,8 @@ export interface LTX23LocalConfig {
   seed: number | null
   // Stream LTX 2.3's natively-generated audio instead of silent anullsrc
   enable_audio: boolean
+  // Output backend: 'rtmp' for Twitch, 'webrtc' for direct-to-browser
+  output_mode: 'rtmp' | 'webrtc'
 }
 
 export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig

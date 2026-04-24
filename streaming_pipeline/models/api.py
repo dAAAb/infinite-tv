@@ -1,4 +1,4 @@
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Union
 from pydantic import BaseModel, Field
 
 
@@ -45,3 +45,7 @@ class StartStreamRequest(BaseModel):
     target_fps: Optional[float] = Field(default=9.0, description="Target streaming FPS")
     mode: Optional[str] = Field(default="regular", description="Generation mode: 'regular' or 'nightmare'")
     enable_audio: Optional[bool] = Field(default=True, description="Stream LTX 2.3's natively-generated audio instead of silent anullsrc (ltx-2.3-local only)")
+    output_mode: Optional[Literal["rtmp", "webrtc"]] = Field(
+        default="rtmp",
+        description="Output backend: 'rtmp' pushes to Twitch via FFmpeg, 'webrtc' streams directly to browser via aiortc",
+    )

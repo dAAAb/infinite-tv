@@ -18,6 +18,7 @@ requirements = [
     "torch==2.7.1+cu128",
     "torchvision==0.22.1+cu128",
     "torchaudio==2.7.1+cu128",  # Used to resample LTX 2.3 vocoder output for native audio streaming
+    "aiortc==1.14.0",  # WebRTC for Python -- used by WebRTCStreamer for direct-to-browser streaming
     "git+https://github.com/huggingface/diffusers.git@main",
     "transformers>=4.47.2,<4.52.0",
     "sentencepiece>=0.1.96",
@@ -82,3 +83,9 @@ class RealtimeStreamingApp(
     async def metrics_websocket(self, websocket: WebSocket) -> None:
         """Real-time metrics streaming via WebSocket"""
         await self.streaming_service.handle_metrics_websocket(websocket)
+
+    @fal.endpoint("/webrtc", is_websocket=True)
+    async def webrtc(self, websocket: WebSocket) -> None:
+        """WebRTC signaling endpoint -- browser connects here to receive
+        the video+audio stream directly via WebRTC instead of RTMP/Twitch."""
+        await self.streaming_service.handle_webrtc(websocket)

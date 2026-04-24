@@ -88,6 +88,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
     noise_scale: 0.15,
     seed: null,
     enable_audio: true,
+    output_mode: 'rtmp',
   })
 
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -807,6 +808,39 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
         )}
 
 
+
+        {/* Output Mode Selector (LTX 2.3 Local only) */}
+        {selectedModel === 'ltx-2.3-local' && (
+          <div>
+            <label className="metric-label mb-3 block">Output Mode</label>
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={() => setLtx23LocalConfig(prev => ({ ...prev, output_mode: 'rtmp' }))}
+                className={`px-4 py-3 rounded-lg text-sm font-medium transition-all border-2 ${
+                  ltx23LocalConfig.output_mode === 'rtmp'
+                    ? 'bg-fal-primary-500 text-white border-fal-primary-500 shadow-lg'
+                    : 'bg-white text-fal-gray-700 hover:bg-fal-gray-50 border-fal-gray-300'
+                }`}
+              >
+                RTMP / Twitch
+                <p className="text-xs mt-1 opacity-75">Push to Twitch via FFmpeg</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setLtx23LocalConfig(prev => ({ ...prev, output_mode: 'webrtc' }))}
+                className={`px-4 py-3 rounded-lg text-sm font-medium transition-all border-2 ${
+                  ltx23LocalConfig.output_mode === 'webrtc'
+                    ? 'bg-fal-primary-500 text-white border-fal-primary-500 shadow-lg'
+                    : 'bg-white text-fal-gray-700 hover:bg-fal-gray-50 border-fal-gray-300'
+                }`}
+              >
+                WebRTC Direct
+                <p className="text-xs mt-1 opacity-75">Stream to browser, sub-1s latency</p>
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Control Buttons */}
         <div className="flex items-center justify-between pt-4 border-t border-fal-gray-700">

@@ -7,6 +7,7 @@ import AIPerformanceBreakdown from '../components/AIPerformanceBreakdown'
 import RealtimeChart from '../components/RealtimeChart'
 import TestControlPanel from '../components/TestControlPanel'
 import GenerationHistory from '../components/GenerationHistory'
+import WebRTCPlayer from '../components/WebRTCPlayer'
 import { useRealtimeWebSocket } from '../hooks/useRealtimeWebSocket'
 import { startStream, stopStream } from '../utils/falApi'
 import { Wifi, WifiOff, AlertCircle, RefreshCw, Square } from 'lucide-react'
@@ -15,6 +16,7 @@ export default function Dashboard() {
   const { metrics, history, isConnected, error, reconnect } = useRealtimeWebSocket()
   const [isStreaming, setIsStreaming] = useState(false)
   const [testResults, setTestResults] = useState<any>(null)
+  const [activeOutputMode, setActiveOutputMode] = useState<'rtmp' | 'webrtc'>('rtmp')
   
   // Detect if streaming is active based on metrics data
   const isActivelyStreaming = metrics?.video?.is_running || (metrics?.rtmp?.queue_size || 0) > 0
@@ -22,6 +24,7 @@ export default function Dashboard() {
   const handleStartTest = async (config: any) => {
     try {
       setIsStreaming(true)
+      setActiveOutputMode(config.output_mode || 'rtmp')
       console.log('🧪 Starting test with config:', config)
       console.log('🧪 Model:', config.model)
       
@@ -186,6 +189,11 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* WebRTC Player (shown when output_mode is webrtc and streaming) */}
+      {activeOutputMode === 'webrtc' && isStreaming && (
+        <WebRTCPlayer apiUrl={process.env.NEXT_PUBLIC_FAL_API_URL || 'http://localhost:8000'} />
       )}
 
       {/* Main Dashboard Grid */}

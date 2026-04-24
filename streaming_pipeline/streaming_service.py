@@ -4,6 +4,7 @@ import time
 from streaming_pipeline.video_generation.video_generator import RealtimeGenerator
 from streaming_pipeline.utils.monitoring import ComponentMonitor
 from streaming_pipeline.output.rtmp_streamer import FFmpegRTMPStreamer
+from streaming_pipeline.output.webrtc_streamer import WebRTCStreamer
 from streaming_pipeline.core.streaming_engine import RealtimeVideoStreamer
 from streaming_pipeline.input.twitch_listener import TwitchChatListener
 from streaming_pipeline.prompt_generation.prompt_generator import PromptGenerator
@@ -19,6 +20,7 @@ class StreamingService:
         self.video_generator = None
         self.video_streamer = None
         self.monitor = None
+        self.webrtc_streamer = None  # Created alongside RTMP, used when output_mode="webrtc"
         self._initialized = False
     
     def setup(self):
@@ -44,38 +46,52 @@ class StreamingService:
         
         if not openai_key:
             raise ValueError("OPENAI_API_KEY environment variable required")
-        if not stream_key:
-            raise ValueError("TWITCH_STREAM_KEY environment variable required")
-        
+
         # Create all dependencies independently (Dependency Injection pattern)
         self.twitch_listener = TwitchChatListener(twitch_channel)
         self.prompt_generator = PromptGenerator(openai_key, groq_key)
-        self.rtmp_streamer = FFmpegRTMPStreamer(
-            stream_key=stream_key,
-            fps=9,  # 233 frames ÷ 9 FPS = 25.9 seconds (safe buffer)
-            width=640,
-            height=480
-        )
+
+        # RTMP streamer (requires TWITCH_STREAM_KEY; optional for webrtc-only)
+        if stream_key:
+            self.rtmp_streamer = FFmpegRTMPStreamer(
+                stream_key=stream_key,
+                fps=9,
+                width=640,
+                height=480,
+            )
+        else:
+            self.rtmp_streamer = None
+            print("⚠️ TWITCH_STREAM_KEY not set -- RTMP output disabled, WebRTC only")
+
+        # WebRTC streamer (always available; no external secrets needed)
+        self.webrtc_streamer = WebRTCStreamer(fps=14, width=512, height=384)
+
         self.text_overlay = TextOverlay(width=640, height=480)
-        
+
+        # Default streamer is RTMP (if available), switchable per /start_stream request
+        active_streamer = self.rtmp_streamer or self.webrtc_streamer
+
         # Inject all dependencies into video streamer
         self.video_streamer = RealtimeVideoStreamer(
             twitch_listener=self.twitch_listener,
             prompt_generator=self.prompt_generator,
             realtime_generator=self.video_generator,
-            rtmp_streamer=self.rtmp_streamer,
-            text_overlay=self.text_overlay
+            rtmp_streamer=active_streamer,
+            text_overlay=self.text_overlay,
         )
-        
+
         # Create generic component monitor
-        self.monitor = ComponentMonitor({
-            "rtmp": self.rtmp_streamer,
+        monitor_components = {
             "video": self.video_streamer,
             "prompt": self.prompt_generator,
             "generator": self.video_generator,
             "overlay": self.text_overlay,
-            "twitch": self.twitch_listener
-        })
+            "twitch": self.twitch_listener,
+        }
+        if self.rtmp_streamer:
+            monitor_components["rtmp"] = self.rtmp_streamer
+        monitor_components["webrtc"] = self.webrtc_streamer
+        self.monitor = ComponentMonitor(monitor_components)
         
         # Start monitoring all components
         self.monitor.start_monitoring()
@@ -146,15 +162,26 @@ class StreamingService:
             if ltx_updates:
                 self.video_streamer.update_ltx_config(**ltx_updates)
             
-            # Update streaming configuration (direct access to RTMP streamer)
+            # Select output backend and swap the streamer injected into the
+            # video_streamer before starting the generation loop.
+            output_mode = getattr(request, "output_mode", "rtmp") or "rtmp"
+            if output_mode == "webrtc":
+                active_streamer = self.webrtc_streamer
+                print(f"   📡 Output mode: WebRTC (direct-to-browser)")
+            else:
+                if self.rtmp_streamer is None:
+                    raise ValueError("RTMP output requested but TWITCH_STREAM_KEY is not set")
+                active_streamer = self.rtmp_streamer
+                print(f"   📡 Output mode: RTMP (Twitch)")
+
+            # Update FPS on whichever streamer is active
             if request.target_fps:
-                self.rtmp_streamer.fps = request.target_fps
+                active_streamer.fps = request.target_fps
                 print(f"   🎛️ Set target_fps: {request.target_fps}")
 
-            # Keep generation frame_rate aligned with the RTMP stream's FPS so
+            # Keep generation frame_rate aligned with the stream's FPS so
             # the LTX 2.3 audio path (duration_s = num_frames / frame_rate)
-            # produces audio that matches actual playback duration.  Honour an
-            # explicit request.frame_rate override if the caller set one.
+            # produces audio that matches actual playback duration.
             effective_frame_rate = request.frame_rate
             if effective_frame_rate is None and request.target_fps:
                 effective_frame_rate = float(request.target_fps)
@@ -162,17 +189,18 @@ class StreamingService:
                 ltx_updates['frame_rate'] = float(effective_frame_rate)
                 print(f"   🎬 frame_rate: {effective_frame_rate} (audio duration matches stream playback)")
 
-            # Toggle native audio per request.  Only affects the next
-            # start_stream() call, so this needs to happen before
-            # video_streamer.start_streaming() spins up RTMP.
-            if request.enable_audio is not None:
+            # Toggle native audio (RTMP only; WebRTC always streams audio)
+            if output_mode == "rtmp" and self.rtmp_streamer and request.enable_audio is not None:
                 self.rtmp_streamer.enable_audio = bool(request.enable_audio)
                 print(f"   🔊 enable_audio: {self.rtmp_streamer.enable_audio}")
-            
+
             if request.width and request.height:
-                self.rtmp_streamer.width = request.width
-                self.rtmp_streamer.height = request.height
+                active_streamer.width = request.width
+                active_streamer.height = request.height
                 print(f"   🎛️ Set resolution: {request.width}x{request.height}")
+
+            # Hot-swap the streamer reference on the video_streamer
+            self.video_streamer.rtmp_streamer = active_streamer
             
             # Set custom initial state if provided
             if request.initial_prompt or request.initial_image_url:
@@ -205,19 +233,20 @@ class StreamingService:
             
             return {
                 "status": "started",
-                "message": "Now live on Twitch! AI-generated content streaming with chat reactivity.",
+                "message": f"Streaming started ({output_mode} mode).",
+                "output_mode": output_mode,
                 "twitch_channel_input": self.video_streamer.twitch_listener.channel_name,
-                "rtmp_url": self.rtmp_streamer.rtmp_url,
+                "rtmp_url": self.rtmp_streamer.rtmp_url if self.rtmp_streamer else None,
                 "initial_prompt": self.video_streamer.initial_prompt,
                 "initial_image_url": self.video_streamer.initial_image_url,
                 "configuration": {
                     "num_frames": self.video_streamer.ltx_config.num_frames,
                     "timesteps": self.video_streamer.ltx_config.timesteps,
-                    "target_fps": self.rtmp_streamer.fps,
+                    "target_fps": active_streamer.fps,
                     "resolution": f"{self.video_streamer.ltx_config.width}x{self.video_streamer.ltx_config.height}",
                     "guidance_scale": self.video_streamer.ltx_config.guidance_scale,
                     "strength": self.video_streamer.ltx_config.strength,
-                    "negative_prompt": self.video_streamer.ltx_config.negative_prompt
+                    "negative_prompt": self.video_streamer.ltx_config.negative_prompt,
                 }
             }
             
@@ -284,6 +313,24 @@ class StreamingService:
                 "timestamp": time.time()
             }
     
+    async def handle_webrtc(self, websocket):
+        """Delegate WebRTC signaling to the active WebRTCStreamer.
+
+        If the streamer is not a WebRTCStreamer (e.g. the user started with
+        RTMP output mode) this falls through gracefully with an error message.
+        """
+        streamer = getattr(self, "webrtc_streamer", None)
+        if streamer is None or not isinstance(streamer, WebRTCStreamer):
+            await websocket.accept()
+            await websocket.send_json({
+                "type": "error",
+                "message": "WebRTC output is not enabled. Start the stream with output_mode='webrtc'.",
+            })
+            await websocket.close()
+            return
+
+        await streamer.handle_signaling(websocket)
+
     async def handle_metrics_websocket(self, websocket, logger=None):
         """Handle WebSocket connection for real-time metrics streaming
         
