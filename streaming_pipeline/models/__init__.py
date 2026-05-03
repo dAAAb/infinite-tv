@@ -25,7 +25,7 @@ from .streaming import (
     StreamingState,
     GenerationResult
 )
-from .api import StartStreamRequest
+from .api import StartStreamRequest, UpdateConfigRequest
 
 # Export all models
 __all__ = [

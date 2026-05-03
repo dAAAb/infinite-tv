@@ -2,7 +2,7 @@ import fal
 from fastapi import WebSocket
 
 from streaming_pipeline.streaming_service import StreamingService
-from streaming_pipeline.models import StartStreamRequest
+from streaming_pipeline.models import StartStreamRequest, UpdateConfigRequest
 from dotenv import load_dotenv
 
 #load_dotenv()
@@ -69,6 +69,11 @@ class RealtimeStreamingApp(
         """Start the complete Twitch streaming pipeline with full LTX configuration"""
         return self.streaming_service.start_streaming(request)
     
+    @fal.endpoint("/update_config")
+    def update_config(self, request: UpdateConfigRequest):
+        """Hot-reload generation params on the live stream without restarting."""
+        return self.streaming_service.update_config(request)
+
     @fal.endpoint("/stop_stream")
     def stop_streaming(self):
         """Stop the streaming pipeline"""

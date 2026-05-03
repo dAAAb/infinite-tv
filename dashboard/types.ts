@@ -145,10 +145,14 @@ export interface LTX23LocalConfig {
   noise_scale: number
   // null = random seed per generation; number = pinned seed
   seed: number | null
+  // LLM temperature for prompt generation
+  llm_temperature: number
   // Stream LTX 2.3's natively-generated audio instead of silent anullsrc
   enable_audio: boolean
   // Output backend: 'rtmp' for Twitch, 'webrtc' for direct-to-browser
   output_mode: 'rtmp' | 'webrtc'
+  // Named combination of system prompt + generation parameters
+  style_preset: 'cohesive' | 'chaotic' | 'nightmare' | 'custom'
 }
 
 export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig

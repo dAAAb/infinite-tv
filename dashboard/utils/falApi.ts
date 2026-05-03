@@ -35,6 +35,13 @@ export async function stopStream(apiUrl: string) {
   });
 }
 
+export async function updateConfig(apiUrl: string, config: any) {
+  return authenticatedFetch(`${apiUrl}/update_config`, {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
 export async function getMetrics(apiUrl: string) {
   return authenticatedFetch(`${apiUrl}/metrics`, {
     method: 'GET',

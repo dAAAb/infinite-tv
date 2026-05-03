@@ -1,12 +1,13 @@
 'use client'
 
 import { useState, useRef } from 'react'
-import { Play, Square, Upload, Settings, Sliders, Zap } from 'lucide-react'
+import { Play, Square, Upload, Settings, Sliders, Zap, RefreshCw } from 'lucide-react'
 import type { TestConfig, LTXv1Config, LTXv2Config, LTX23LocalConfig, ModelType } from '../types'
 
 interface TestControlPanelProps {
   onStartTest: (config: TestConfig) => void
   onStopTest: () => void
+  onUpdateConfig?: (config: any) => Promise<void> | void
   isStreaming: boolean
 }
 
@@ -34,7 +35,7 @@ function findPresetKey(width: number, height: number): string {
   return match ? `${match.width}x${match.height}` : PRESET_CUSTOM
 }
 
-export default function TestControlPanel({ onStartTest, onStopTest, isStreaming }: TestControlPanelProps) {
+export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConfig, isStreaming }: TestControlPanelProps) {
   // Default to ltx-2.3-local because the backend's default LOAD_LTX23_PIPELINE=true
   // only loads that pipeline.  Selecting ltxv1 here without setting
   // LOAD_LOCAL_PIPELINE=true on the backend will hit "Pipeline not loaded".
@@ -71,12 +72,12 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
   const [ltx23LocalConfig, setLtx23LocalConfig] = useState<LTX23LocalConfig>({
     model: 'ltx-2.3-local',
     initial_prompt: "A cinematic video with smooth camera movement and realistic motion",
-    initial_image_url: "https://storage.googleapis.com/remade-v2/uploads/a185f836a3e9ca84cc75f5c12bb10dd4.jpg",
+    initial_image_url: "https://scriptmag.com/uploads/MTY3Mzc4OTYwMzA5ODg4NjI0/image-placeholder-title.jpg?format=auto&optimize=high&width=1440",
     negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted, static scene, frozen frame, no motion, repetitive, looping",
     height: 384,
     width: 512,
     num_frames: 121,
-    target_fps: 14.0,
+    target_fps: 20.0,
     mode: 'regular',
     // Fixation-control defaults (mirror backend api.py defaults).
     // STG defaults to OFF because it requires spatio_temporal_guidance_blocks
@@ -87,12 +88,29 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
     spatio_temporal_guidance_blocks: null,
     noise_scale: 0.15,
     seed: null,
+    llm_temperature: 0.4,
     enable_audio: true,
     output_mode: 'rtmp',
+    style_preset: 'cohesive',
   })
 
-  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(true)
   const [uploadingImage, setUploadingImage] = useState(false)
+  const [applyStatus, setApplyStatus] = useState<'idle' | 'applying' | 'applied'>('idle')
+  const [showSystemPrompt, setShowSystemPrompt] = useState(false)
+
+  // System prompt text for each preset (read-only display)
+  const SYSTEM_PROMPT_PREVIEWS: Record<string, string> = {
+    cohesive: `You are directing a continuous, cohesive animated video stream. Your job is to write the NEXT few seconds of the story -- not a new story.\n\nCORE PRINCIPLE: CONTINUITY FIRST\nThe viewer should feel they are watching ONE continuous video. Every prompt must feel like the natural next 5-10 seconds of what is already happening.\n\nSTORYTELLING RULES:\n1. CONTINUE the current scene -- same characters, same location, same mood\n2. Add SMALL developments: a character looks at something, picks up an object\n3. Change happens GRADUALLY\n4. New elements ENTER naturally\n5. Location changes through TRANSITIONS, not cuts`,
+    chaotic: `You are creating video prompts for continuous video generation with VISUAL AWARENESS.\n\nCRITICAL STORYTELLING RULES:\n1. NEVER REPEAT - If recent prompts are similar, FORCE dramatic change\n2. ALWAYS PROGRESS - Each prompt must ADD something new or CHANGE something significant\n3. BE BOLD - Don't just describe what you see, TRANSFORM it\n4. FIX PROBLEMS - If scene is messy/boring, use dramatic transitions`,
+    nightmare: `Same as Chaotic, but with MODE = "nightmare":\nMake ALL prompts nightmarish/bizarre/outlandish. Transform normal actions into surreal/disturbing scenarios.`,
+    custom: `Using the current system prompt on the server. Edit the .txt files and redeploy to change, or use the Apply Changes button with custom parameter values.`,
+  }
+
+  // When user manually edits an Advanced param, auto-switch to "custom" preset
+  const updateLocalParam = (updates: Partial<LTX23LocalConfig>) => {
+    setLtx23LocalConfig(prev => ({ ...prev, ...updates, style_preset: 'custom' }))
+  }
   const fileInputRef = useRef<HTMLInputElement>(null)
   
   // Get current config based on selected model
@@ -663,7 +681,12 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
         {/* Advanced Parameters - LTX 2.3 Local (fixation-control knobs) */}
         {showAdvanced && selectedModel === 'ltx-2.3-local' && (
           <div className="space-y-4 border-t border-fal-gray-700 pt-6">
-            <h4 className="text-fal-gray-900 font-medium">Advanced LTX 2.3 Local Parameters</h4>
+            <h4 className="text-fal-gray-900 font-medium">
+              Advanced LTX 2.3 Local Parameters
+              {ltx23LocalConfig.style_preset !== 'custom' && (
+                <span className="text-xs font-normal text-fal-gray-500 ml-2">(preset: {ltx23LocalConfig.style_preset} -- edit to customize)</span>
+              )}
+            </h4>
             <p className="text-xs text-fal-gray-600">
               Tune these to fight scene fixation. Higher <code>guidance_scale</code> makes
               the prompt matter more; <code>noise_scale</code> injects entropy into the
@@ -680,7 +703,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                 <input
                   type="number"
                   value={ltx23LocalConfig.num_frames}
-                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, num_frames: parseInt(e.target.value) }))}
+                  onChange={(e) => updateLocalParam({ num_frames: parseInt(e.target.value) })}
                   className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
                   min={9}
                   max={241}
@@ -693,7 +716,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                 <input
                   type="number"
                   value={ltx23LocalConfig.guidance_scale}
-                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, guidance_scale: parseFloat(e.target.value) }))}
+                  onChange={(e) => updateLocalParam({ guidance_scale: parseFloat(e.target.value) })}
                   className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
                   min={1}
                   max={7}
@@ -706,7 +729,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                 <input
                   type="number"
                   value={ltx23LocalConfig.stg_scale}
-                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, stg_scale: parseFloat(e.target.value) }))}
+                  onChange={(e) => updateLocalParam({ stg_scale: parseFloat(e.target.value) })}
                   className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
                   min={0}
                   max={3}
@@ -723,13 +746,13 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                   onChange={(e) => {
                     const raw = e.target.value.trim()
                     if (!raw) {
-                      setLtx23LocalConfig(prev => ({ ...prev, spatio_temporal_guidance_blocks: null }))
+                      updateLocalParam({ spatio_temporal_guidance_blocks: null })
                       return
                     }
                     const blocks = raw.split(',')
                       .map(s => parseInt(s.trim()))
                       .filter(n => !isNaN(n) && n >= 0)
-                    setLtx23LocalConfig(prev => ({ ...prev, spatio_temporal_guidance_blocks: blocks.length ? blocks : null }))
+                    updateLocalParam({ spatio_temporal_guidance_blocks: blocks.length ? blocks : null })
                   }}
                   className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono text-sm"
                 />
@@ -740,11 +763,24 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                 <input
                   type="number"
                   value={ltx23LocalConfig.noise_scale}
-                  onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, noise_scale: parseFloat(e.target.value) }))}
+                  onChange={(e) => updateLocalParam({ noise_scale: parseFloat(e.target.value) })}
                   className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
                   min={0}
                   max={0.3}
                   step={0.01}
+                />
+              </div>
+
+              <div>
+                <label className="metric-label mb-2 block text-xs">LLM temperature</label>
+                <input
+                  type="number"
+                  value={ltx23LocalConfig.llm_temperature}
+                  onChange={(e) => updateLocalParam({ llm_temperature: parseFloat(e.target.value) })}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono"
+                  min={0.1}
+                  max={1.5}
+                  step={0.1}
                 />
               </div>
 
@@ -758,7 +794,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                     disabled={ltx23LocalConfig.seed === null}
                     onChange={(e) => {
                       const v = e.target.value
-                      setLtx23LocalConfig(prev => ({ ...prev, seed: v === '' ? null : parseInt(v) }))
+                      updateLocalParam({ seed: v === '' ? null : parseInt(v) })
                     }}
                     className="flex-1 bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono disabled:opacity-50"
                     min={0}
@@ -769,7 +805,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                       type="checkbox"
                       checked={ltx23LocalConfig.seed === null}
                       onChange={(e) => {
-                        setLtx23LocalConfig(prev => ({ ...prev, seed: e.target.checked ? null : 0 }))
+                        updateLocalParam({ seed: e.target.checked ? null : 0 })
                       }}
                     />
                     <span>Random per generation</span>
@@ -782,7 +818,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
               <label className="metric-label mb-2 block text-xs">Negative Prompt</label>
               <textarea
                 value={ltx23LocalConfig.negative_prompt}
-                onChange={(e) => setLtx23LocalConfig(prev => ({ ...prev, negative_prompt: e.target.value }))}
+                onChange={(e) => updateLocalParam({ negative_prompt: e.target.value })}
                 className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 font-mono text-sm"
                 rows={2}
               />
@@ -804,10 +840,73 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                 for this toggle to take effect.
               </p>
             </div>
+
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowSystemPrompt(!showSystemPrompt)}
+                className="text-sm text-fal-primary-500 hover:text-fal-primary-600 font-medium"
+              >
+                {showSystemPrompt ? 'Hide' : 'Show'} System Prompt
+              </button>
+              {showSystemPrompt && (
+                <div className="mt-2 bg-fal-gray-50 border border-fal-gray-200 rounded-lg p-3">
+                  <p className="text-xs text-fal-gray-500 mb-2 font-medium">
+                    System prompt for preset: <strong>{ltx23LocalConfig.style_preset}</strong>
+                  </p>
+                  <pre className="text-xs text-fal-gray-700 whitespace-pre-wrap font-mono leading-relaxed max-h-64 overflow-y-auto">
+                    {SYSTEM_PROMPT_PREVIEWS[ltx23LocalConfig.style_preset] || 'Unknown preset'}
+                  </pre>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
 
+
+        {/* Style Preset Selector (LTX 2.3 Local only) */}
+        {selectedModel === 'ltx-2.3-local' && (
+          <div>
+            <label className="metric-label mb-3 block">Style Preset</label>
+            <div className="grid grid-cols-4 gap-2">
+              {([
+                { id: 'cohesive', label: 'Cohesive', desc: 'Smooth story evolution' },
+                { id: 'chaotic', label: 'Chaotic', desc: 'Dramatic scene changes' },
+                { id: 'nightmare', label: 'Nightmare', desc: 'Surreal fever dream' },
+                { id: 'custom', label: 'Custom', desc: 'Manual Advanced values' },
+              ] as const).map(preset => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => {
+                    const PRESET_PARAMS: Record<string, Partial<LTX23LocalConfig>> = {
+                      cohesive:  { guidance_scale: 2.0, noise_scale: 0.03, llm_temperature: 0.4, mode: 'regular' },
+                      chaotic:   { guidance_scale: 3.0, noise_scale: 0.15, llm_temperature: 0.7, mode: 'regular' },
+                      nightmare: { guidance_scale: 3.5, noise_scale: 0.20, llm_temperature: 0.9, mode: 'nightmare' },
+                    }
+                    const overrides = PRESET_PARAMS[preset.id] || {}
+                    setLtx23LocalConfig(prev => ({ ...prev, ...overrides, style_preset: preset.id }))
+                  }}
+                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all border-2 ${
+                    ltx23LocalConfig.style_preset === preset.id
+                      ? 'bg-fal-primary-500 text-white border-fal-primary-500 shadow-lg'
+                      : 'bg-white text-fal-gray-700 hover:bg-fal-gray-50 border-fal-gray-300'
+                  }`}
+                >
+                  {preset.label}
+                  <p className="text-xs mt-0.5 opacity-75">{preset.desc}</p>
+                </button>
+              ))}
+            </div>
+            {ltx23LocalConfig.style_preset !== 'custom' && (
+              <p className="text-xs text-fal-gray-600 mt-2">
+                Preset overrides guidance_scale, noise_scale, and LLM temperature.
+                Switch to <strong>Custom</strong> for full manual control via Advanced.
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Output Mode Selector (LTX 2.3 Local only) */}
         {selectedModel === 'ltx-2.3-local' && (
@@ -867,13 +966,52 @@ export default function TestControlPanel({ onStartTest, onStopTest, isStreaming 
                 <span>Start Stream</span>
               </button>
             ) : (
-              <button
-                onClick={onStopTest}
-                className="bg-fal-red-500 hover:bg-fal-red-600 text-white font-medium px-6 py-2 rounded-lg transition-colors flex items-center space-x-2"
-              >
-                <Square className="w-4 h-4" />
-                <span>Stop Stream</span>
-              </button>
+              <div className="flex items-center space-x-3">
+                <button
+                  onClick={onStopTest}
+                  className="bg-fal-red-500 hover:bg-fal-red-600 text-white font-medium px-6 py-2 rounded-lg transition-colors flex items-center space-x-2"
+                >
+                  <Square className="w-4 h-4" />
+                  <span>Stop Stream</span>
+                </button>
+                {onUpdateConfig && selectedModel === 'ltx-2.3-local' && (
+                  <button
+                    onClick={async () => {
+                      setApplyStatus('applying')
+                      try {
+                        await onUpdateConfig({
+                          guidance_scale: ltx23LocalConfig.guidance_scale,
+                          noise_scale: ltx23LocalConfig.noise_scale,
+                          seed: ltx23LocalConfig.seed,
+                          negative_prompt: ltx23LocalConfig.negative_prompt,
+                          num_frames: ltx23LocalConfig.num_frames,
+                          stg_scale: ltx23LocalConfig.stg_scale,
+                          spatio_temporal_guidance_blocks: ltx23LocalConfig.spatio_temporal_guidance_blocks,
+                          llm_temperature: ltx23LocalConfig.llm_temperature,
+                          style_preset: ltx23LocalConfig.style_preset,
+                        })
+                        setApplyStatus('applied')
+                        setTimeout(() => setApplyStatus('idle'), 3000)
+                      } catch {
+                        setApplyStatus('idle')
+                      }
+                    }}
+                    disabled={applyStatus === 'applying'}
+                    className={`font-medium px-6 py-2 rounded-lg transition-all flex items-center space-x-2 ${
+                      applyStatus === 'applied'
+                        ? 'bg-green-500 text-white'
+                        : applyStatus === 'applying'
+                        ? 'bg-fal-yellow-300 text-black opacity-75 cursor-wait'
+                        : 'bg-fal-yellow-500 hover:bg-fal-yellow-600 text-black'
+                    }`}
+                  >
+                    <RefreshCw className={`w-4 h-4 ${applyStatus === 'applying' ? 'animate-spin' : ''}`} />
+                    <span>
+                      {applyStatus === 'applied' ? 'Applied! (next clip)' : applyStatus === 'applying' ? 'Applying...' : 'Apply Changes'}
+                    </span>
+                  </button>
+                )}
+              </div>
             )}
           </div>
           

@@ -131,11 +131,17 @@ class LTXAudioTrack:
                 else:
                     chunk = b"\x00" * needed
 
-                samples = np.frombuffer(chunk, dtype=np.int16).reshape(
-                    1, AUDIO_CHANNELS, AUDIO_SAMPLES_PER_FRAME
+                # av.AudioFrame.from_ndarray with format="s16" and layout="stereo"
+                # expects shape (channels, samples) = (2, 882).  The raw PCM is
+                # interleaved L,R,L,R... so we reshape to (samples, 2) then
+                # transpose to (2, samples).
+                interleaved = np.frombuffer(chunk, dtype=np.int16).reshape(
+                    AUDIO_SAMPLES_PER_FRAME, AUDIO_CHANNELS
                 )
+                planar = interleaved.T.copy()  # (2, 882), C-contiguous
+
                 frame = av.AudioFrame.from_ndarray(
-                    samples, format="s16", layout="stereo"
+                    planar, format="s16", layout="stereo"
                 )
                 frame.sample_rate = AUDIO_SAMPLE_RATE
                 frame.pts = self._pts

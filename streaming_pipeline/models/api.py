@@ -2,6 +2,21 @@ from typing import Optional, List, Literal, Union
 from pydantic import BaseModel, Field
 
 
+class UpdateConfigRequest(BaseModel):
+    """Hot-reloadable params applied to the next generation cycle without
+    stopping the stream.  All fields are optional; only supplied fields
+    are updated."""
+    guidance_scale: Optional[float] = None
+    noise_scale: Optional[float] = None
+    seed: Optional[int] = None
+    negative_prompt: Optional[str] = None
+    num_frames: Optional[int] = None
+    stg_scale: Optional[float] = None
+    spatio_temporal_guidance_blocks: Optional[List[int]] = None
+    llm_temperature: Optional[float] = None
+    style_preset: Optional[Literal["cohesive", "chaotic", "nightmare", "custom"]] = None
+
+
 class StartStreamRequest(BaseModel):
     # Model Selection
     model: Optional[Literal["ltxv1", "ltx-2.3", "ltx-2.3-local"]] = Field(default="ltxv1", description="Which model to use for generation")
@@ -48,4 +63,9 @@ class StartStreamRequest(BaseModel):
     output_mode: Optional[Literal["rtmp", "webrtc"]] = Field(
         default="rtmp",
         description="Output backend: 'rtmp' pushes to Twitch via FFmpeg, 'webrtc' streams directly to browser via aiortc",
+    )
+    llm_temperature: Optional[float] = Field(default=0.7, description="LLM temperature for prompt generation (lower = more predictable, higher = more creative)")
+    style_preset: Optional[Literal["cohesive", "chaotic", "nightmare", "custom"]] = Field(
+        default="cohesive",
+        description="Named combination of system prompt + generation parameters. 'custom' uses the raw Advanced panel values.",
     )

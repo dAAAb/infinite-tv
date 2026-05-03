@@ -115,10 +115,17 @@ export default function WebRTCPlayer({ apiUrl }: WebRTCPlayerProps) {
             }
           }
 
+          // Collect all incoming tracks into a single MediaStream so both
+          // video and audio are attached to the same <video> element.
+          const remoteStream = new MediaStream()
+
           pc.ontrack = (event) => {
-            console.log(`WebRTC: received track kind=${event.track.kind}`)
-            if (videoRef.current && event.streams[0]) {
-              videoRef.current.srcObject = event.streams[0]
+            console.log(`WebRTC: received track kind=${event.track.kind} id=${event.track.id}`)
+            remoteStream.addTrack(event.track)
+            if (videoRef.current) {
+              videoRef.current.srcObject = remoteStream
+              // Re-trigger play in case the element paused waiting for tracks
+              videoRef.current.play().catch(() => {})
             }
           }
 
@@ -163,8 +170,13 @@ export default function WebRTCPlayer({ apiUrl }: WebRTCPlayerProps) {
 
   const toggleMute = () => {
     if (videoRef.current) {
-      videoRef.current.muted = !videoRef.current.muted
-      setMuted(videoRef.current.muted)
+      const shouldMute = !videoRef.current.muted
+      videoRef.current.muted = shouldMute
+      if (!shouldMute) {
+        videoRef.current.volume = 1.0
+        videoRef.current.play().catch(() => {})
+      }
+      setMuted(shouldMute)
     }
   }
 

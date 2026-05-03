@@ -158,10 +158,34 @@ class StreamingService:
             if request.aspect_ratio:
                 ltx_updates['aspect_ratio'] = request.aspect_ratio
                 print(f"   📏 Aspect Ratio: {request.aspect_ratio}")
+            # Apply style preset (system prompt + generation param overrides).
+            # Must happen BEFORE ltx_updates are applied so preset params
+            # get merged, and before the generation loop starts.
+            PRESET_PARAMS = {
+                "cohesive":  {"guidance_scale": 2.0, "noise_scale": 0.03},
+                "chaotic":   {"guidance_scale": 3.0, "noise_scale": 0.15},
+                "nightmare": {"guidance_scale": 3.5, "noise_scale": 0.20},
+            }
+            preset = getattr(request, "style_preset", None) or "cohesive"
+            if preset != "custom":
+                self.prompt_generator.set_style_preset(preset)
+                if preset in PRESET_PARAMS:
+                    ltx_updates.update(PRESET_PARAMS[preset])
+                if preset == "nightmare":
+                    self.video_streamer.state.mode = "nightmare"
+                print(f"   🎨 Style preset: {preset}")
+            else:
+                print(f"   🎨 Style preset: custom (using Advanced panel values)")
+
+            # Explicit LLM temperature override (after preset, so it wins)
+            if getattr(request, "llm_temperature", None) is not None:
+                self.prompt_generator.temperature = float(request.llm_temperature)
+                print(f"   🌡️ LLM temperature: {request.llm_temperature}")
+
             # Apply all updates at once
             if ltx_updates:
                 self.video_streamer.update_ltx_config(**ltx_updates)
-            
+
             # Select output backend and swap the streamer injected into the
             # video_streamer before starting the generation loop.
             output_mode = getattr(request, "output_mode", "rtmp") or "rtmp"
@@ -256,6 +280,74 @@ class StreamingService:
                 "message": f"Failed to start streaming: {e}"
             }
     
+    def update_config(self, request):
+        """Hot-reload generation params on a live stream.
+
+        Only touches params that can change mid-stream without restarting
+        (no model swap, no output_mode change, no initial image change).
+        The next generation cycle picks up the new values immediately.
+        """
+        if not self.video_streamer or not self.video_streamer.state.is_running:
+            return {"status": "error", "message": "No active stream to update"}
+
+        ltx_updates = {}
+        updated_fields = []
+
+        if request.guidance_scale is not None:
+            ltx_updates["guidance_scale"] = request.guidance_scale
+            updated_fields.append(f"guidance_scale={request.guidance_scale}")
+        if request.noise_scale is not None:
+            ltx_updates["noise_scale"] = request.noise_scale
+            updated_fields.append(f"noise_scale={request.noise_scale}")
+        if request.seed is not None:
+            ltx_updates["seed"] = request.seed
+            updated_fields.append(f"seed={request.seed}")
+        if request.negative_prompt is not None:
+            ltx_updates["negative_prompt"] = request.negative_prompt
+            updated_fields.append("negative_prompt")
+        if request.num_frames is not None:
+            ltx_updates["num_frames"] = request.num_frames
+            updated_fields.append(f"num_frames={request.num_frames}")
+        if request.stg_scale is not None:
+            ltx_updates["stg_scale"] = request.stg_scale
+            updated_fields.append(f"stg_scale={request.stg_scale}")
+        if request.spatio_temporal_guidance_blocks is not None:
+            ltx_updates["spatio_temporal_guidance_blocks"] = request.spatio_temporal_guidance_blocks
+            updated_fields.append(f"stg_blocks={request.spatio_temporal_guidance_blocks}")
+
+        # Explicit LLM temperature override
+        if request.llm_temperature is not None:
+            self.prompt_generator.temperature = float(request.llm_temperature)
+            updated_fields.append(f"llm_temperature={request.llm_temperature}")
+
+        # Apply style preset if provided (swaps system prompt + overrides params)
+        PRESET_PARAMS = {
+            "cohesive":  {"guidance_scale": 2.0, "noise_scale": 0.03},
+            "chaotic":   {"guidance_scale": 3.0, "noise_scale": 0.15},
+            "nightmare": {"guidance_scale": 3.5, "noise_scale": 0.20},
+        }
+        if request.style_preset and request.style_preset != "custom":
+            self.prompt_generator.set_style_preset(request.style_preset)
+            if request.style_preset in PRESET_PARAMS:
+                ltx_updates.update(PRESET_PARAMS[request.style_preset])
+            if request.style_preset == "nightmare":
+                self.video_streamer.state.mode = "nightmare"
+            else:
+                self.video_streamer.state.mode = "regular"
+            updated_fields.append(f"style_preset={request.style_preset}")
+
+        if ltx_updates:
+            self.video_streamer.update_ltx_config(**ltx_updates)
+
+        summary = ", ".join(updated_fields) if updated_fields else "no changes"
+        print(f"🔄 Hot-reload config: {summary}")
+
+        return {
+            "status": "updated",
+            "message": f"Config updated: {summary}",
+            "updated_fields": updated_fields,
+        }
+
     def stop_streaming(self):
         """Stop the streaming pipeline"""
         try:

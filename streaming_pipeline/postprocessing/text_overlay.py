@@ -217,25 +217,69 @@ class TextOverlay(Monitorable):
         frame.paste(self._overlay_cache, (0, self._overlay_y), self._overlay_cache)
         return frame
     
+    # Fraction of a batch's frames that show the caption (the rest are clean,
+    # creating a visual gap before the next caption arrives).
+    CAPTION_VISIBLE_RATIO = 0.4
+    # Number of frames over which the caption fades out at the end of the
+    # visible window.  Keeps the transition smooth instead of a hard cut.
+    FADE_OUT_FRAMES = 6
+
     def apply_overlay_batch(self, frames: List[Image.Image]) -> List[Image.Image]:
-        """Apply overlay to multiple frames with performance tracking"""
+        """Apply overlay to the first portion of a batch, with a fade-out.
+
+        Only the first ~40% of frames carry the caption; the remainder play
+        clean.  This creates a natural pause before the next generation's
+        caption appears, preventing the "clashing captions" look.
+        """
         if not frames:
             return frames
-        
+
         start_time = time.time()
-        
-        overlaid_frames = []
-        for frame in frames:
-            overlaid_frame = self.apply_overlay(frame)
-            overlaid_frames.append(overlaid_frame)
-        
-        # Track performance
+
+        n = len(frames)
+        visible_end = max(1, int(n * self.CAPTION_VISIBLE_RATIO))
+        fade_start = max(0, visible_end - self.FADE_OUT_FRAMES)
+
+        for i in range(n):
+            if i < fade_start:
+                self.apply_overlay(frames[i])
+            elif i < visible_end:
+                # Fade-out region: paste with decreasing alpha.
+                self._apply_overlay_with_alpha(
+                    frames[i],
+                    alpha=1.0 - (i - fade_start) / max(1, visible_end - fade_start),
+                )
+            # else: frame stays clean (no overlay)
+
         self.last_batch_time = time.time() - start_time
-        self.last_batch_size = len(frames)
-        self.total_frames_processed += len(frames)
+        self.last_batch_size = n
+        self.total_frames_processed += n
         self.total_processing_time += self.last_batch_time
-        
-        return overlaid_frames
+
+        return frames
+
+    def _apply_overlay_with_alpha(self, frame: Image.Image, alpha: float) -> Image.Image:
+        """Like apply_overlay but blends the cached bitmap at reduced opacity."""
+        if not self.current_text or alpha <= 0:
+            return frame
+
+        frame_w, frame_h = frame.size
+        key = (self.current_text, frame_w, frame_h)
+        if key != self._cache_key or self._overlay_cache is None:
+            self._overlay_cache, self._overlay_y = self._build_overlay(self.current_text, frame_w, frame_h)
+            self._cache_key = key
+
+        if alpha >= 1.0:
+            frame.paste(self._overlay_cache, (0, self._overlay_y), self._overlay_cache)
+        else:
+            # Scale the alpha channel of the cached overlay for the fade.
+            faded = self._overlay_cache.copy()
+            a = faded.split()[3]
+            a = a.point(lambda p: int(p * alpha))
+            faded.putalpha(a)
+            frame.paste(faded, (0, self._overlay_y), faded)
+
+        return frame
     
     def reset_metrics(self):
         """Reset performance metrics"""

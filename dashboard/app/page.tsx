@@ -9,7 +9,7 @@ import TestControlPanel from '../components/TestControlPanel'
 import GenerationHistory from '../components/GenerationHistory'
 import WebRTCPlayer from '../components/WebRTCPlayer'
 import { useRealtimeWebSocket } from '../hooks/useRealtimeWebSocket'
-import { startStream, stopStream } from '../utils/falApi'
+import { startStream, stopStream, updateConfig } from '../utils/falApi'
 import { Wifi, WifiOff, AlertCircle, RefreshCw, Square } from 'lucide-react'
 
 export default function Dashboard() {
@@ -102,6 +102,22 @@ export default function Dashboard() {
     }
   }
 
+  const handleUpdateConfig = async (config: any) => {
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_FAL_API_URL || 'http://localhost:8000'
+      const response = await updateConfig(apiUrl, config)
+      if (response.ok) {
+        const result = await response.json()
+        console.log('🔄 Config updated:', result)
+        setTestResults(result)
+      } else {
+        console.error('Failed to update config:', response.status)
+      }
+    } catch (error: any) {
+      console.error('Failed to update config:', error)
+    }
+  }
+
   return (
     <div className="space-y-8">
       {/* FAL Status Bar */}
@@ -172,6 +188,7 @@ export default function Dashboard() {
       <TestControlPanel 
         onStartTest={handleStartTest}
         onStopTest={handleStopTest}
+        onUpdateConfig={handleUpdateConfig}
         isStreaming={isStreaming}
       />
 
