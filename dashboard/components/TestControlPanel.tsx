@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react'
 import { Play, Square, Upload, Settings, Sliders, Zap, RefreshCw } from 'lucide-react'
-import type { TestConfig, LTXv1Config, LTXv2Config, LTX23LocalConfig, ModelType } from '../types'
+import type { TestConfig, LTXv1Config, LTXv2Config, LTX23LocalConfig, LTX23ConditionConfig, CharacterRef, ModelType } from '../types'
 
 interface TestControlPanelProps {
   onStartTest: (config: TestConfig) => void
@@ -88,10 +88,16 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
     spatio_temporal_guidance_blocks: null,
     noise_scale: 0.15,
     seed: null,
-    llm_temperature: 0.4,
+    llm_temperature: 0.55,
     enable_audio: true,
     output_mode: 'rtmp',
     style_preset: 'cohesive',
+  })
+
+  const [ltx23ConditionConfig, setLtx23ConditionConfig] = useState<LTX23ConditionConfig>({
+    ...ltx23LocalConfig,
+    model: 'ltx-2.3-condition',
+    character_refs: [],
   })
 
   const [showAdvanced, setShowAdvanced] = useState(true)
@@ -101,7 +107,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
 
   // System prompt text for each preset (read-only display)
   const SYSTEM_PROMPT_PREVIEWS: Record<string, string> = {
-    cohesive: `You are directing a continuous, cohesive animated video stream. Your job is to write the NEXT few seconds of the story -- not a new story.\n\nCORE PRINCIPLE: CONTINUITY FIRST\nThe viewer should feel they are watching ONE continuous video. Every prompt must feel like the natural next 5-10 seconds of what is already happening.\n\nSTORYTELLING RULES:\n1. CONTINUE the current scene -- same characters, same location, same mood\n2. Add SMALL developments: a character looks at something, picks up an object\n3. Change happens GRADUALLY\n4. New elements ENTER naturally\n5. Location changes through TRANSITIONS, not cuts`,
+    cohesive: `You are the writer and director of an ongoing animated story. The characters on screen are PROTAGONISTS with personalities, goals, and emotions.\n\nSTORY RHYTHM (based on clip number):\n- Clips 1-3: ESTABLISH the scene\n- Clips 4-6: INTRODUCE a situation (something catches attention)\n- Clips 7-10: DEVELOP tension (investigate, encounter problems)\n- Clips 11-15: ESCALATE (consequences, choices, surprises)\n- Clips 16+: RESOLVE and RESET (new cycle)\n\nCHARACTER DIRECTION:\n- Characters WANT things, TRY things, REACT to things\n- They have emotions: curiosity, surprise, frustration, joy\n- They make DECISIONS that drive the story forward\n\nUses initial prompt as "story premise" and generation_count for rhythm.`,
     chaotic: `You are creating video prompts for continuous video generation with VISUAL AWARENESS.\n\nCRITICAL STORYTELLING RULES:\n1. NEVER REPEAT - If recent prompts are similar, FORCE dramatic change\n2. ALWAYS PROGRESS - Each prompt must ADD something new or CHANGE something significant\n3. BE BOLD - Don't just describe what you see, TRANSFORM it\n4. FIX PROBLEMS - If scene is messy/boring, use dramatic transitions`,
     nightmare: `Same as Chaotic, but with MODE = "nightmare":\nMake ALL prompts nightmarish/bizarre/outlandish. Transform normal actions into surreal/disturbing scenarios.`,
     custom: `Using the current system prompt on the server. Edit the .txt files and redeploy to change, or use the Apply Changes button with custom parameter values.`,
@@ -115,6 +121,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
   
   // Get current config based on selected model
   const config = selectedModel === 'ltxv1' ? ltxv1Config 
+    : selectedModel === 'ltx-2.3-condition' ? ltx23ConditionConfig
     : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig 
     : ltxv2Config
   
@@ -122,6 +129,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
   const displayedPrompt = selectedModel === 'ltxv1' && ltxv1Config.mode === 'nightmare' && !ltxv1Config.initial_prompt.startsWith('(Nightmare Started)')
     ? `(Nightmare Started) ${ltxv1Config.initial_prompt}`
     : selectedModel === 'ltxv1' ? ltxv1Config.initial_prompt 
+    : selectedModel === 'ltx-2.3-condition' ? ltx23ConditionConfig.initial_prompt
     : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_prompt
     : ltxv2Config.prompt
 
@@ -198,7 +206,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
         {/* Model Selector */}
         <div>
           <label className="metric-label mb-3 block">Select Model</label>
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <button
               type="button"
               onClick={() => setSelectedModel('ltxv1')}
@@ -245,6 +253,22 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                 <span>LTX 2.3 Local</span>
               </div>
               <p className="text-xs mt-1 opacity-75">22B distilled FP8</p>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSelectedModel('ltx-2.3-condition')}
+              className={`px-4 py-3 rounded-lg text-sm font-medium transition-all border-2 ${
+                selectedModel === 'ltx-2.3-condition'
+                  ? 'bg-fal-primary-500 text-white border-fal-primary-500 shadow-lg'
+                  : 'bg-white text-fal-gray-700 hover:bg-fal-gray-50 border-fal-gray-300'
+              }`}
+            >
+              <div className="flex items-center justify-center space-x-2">
+                <Zap className="w-4 h-4" />
+                <span>LTX 2.3 Condition</span>
+              </div>
+              <p className="text-xs mt-1 opacity-75">Multi-character refs</p>
             </button>
           </div>
         </div>
@@ -678,8 +702,8 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
           </div>
         )}
 
-        {/* Advanced Parameters - LTX 2.3 Local (fixation-control knobs) */}
-        {showAdvanced && selectedModel === 'ltx-2.3-local' && (
+        {/* Advanced Parameters - LTX 2.3 Local + Condition (fixation-control knobs) */}
+        {showAdvanced && (selectedModel === 'ltx-2.3-local' || selectedModel === 'ltx-2.3-condition') && (
           <div className="space-y-4 border-t border-fal-gray-700 pt-6">
             <h4 className="text-fal-gray-900 font-medium">
               Advanced LTX 2.3 Local Parameters
@@ -865,8 +889,122 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
 
 
 
-        {/* Style Preset Selector (LTX 2.3 Local only) */}
-        {selectedModel === 'ltx-2.3-local' && (
+        {/* Character References (LTX 2.3 Condition only) */}
+        {selectedModel === 'ltx-2.3-condition' && (
+          <div>
+            <label className="metric-label mb-3 block">Character References</label>
+            <p className="text-xs text-fal-gray-600 mb-3">
+              Add up to 4 character reference images. The model uses these as visual anchors
+              for character consistency. Characters appear in the story when the narrative calls for them.
+            </p>
+            <div className="space-y-3">
+              {ltx23ConditionConfig.character_refs.map((ref, idx) => (
+                <div key={idx} className="flex items-start space-x-3 bg-fal-gray-50 border border-fal-gray-200 rounded-lg p-3">
+                  {ref.image && (
+                    <img
+                      src={ref.image.startsWith('data:') ? ref.image : ref.image}
+                      alt={ref.label || `Character ${idx + 1}`}
+                      className="w-16 h-16 rounded object-cover flex-shrink-0"
+                    />
+                  )}
+                  <div className="flex-1 space-y-2">
+                    <input
+                      type="text"
+                      placeholder="Character name (e.g. Homer Simpson)"
+                      value={ref.label}
+                      onChange={(e) => {
+                        const updated = [...ltx23ConditionConfig.character_refs]
+                        updated[idx] = { ...ref, label: e.target.value }
+                        setLtx23ConditionConfig(prev => ({ ...prev, character_refs: updated }))
+                      }}
+                      className="w-full bg-white border border-fal-gray-300 rounded p-2 text-sm text-fal-gray-900"
+                    />
+                    <div className="flex items-center space-x-3">
+                      <input
+                        type="text"
+                        placeholder="Image URL or upload below"
+                        value={ref.image.startsWith('data:') ? '(uploaded)' : ref.image}
+                        onChange={(e) => {
+                          const updated = [...ltx23ConditionConfig.character_refs]
+                          updated[idx] = { ...ref, image: e.target.value }
+                          setLtx23ConditionConfig(prev => ({ ...prev, character_refs: updated }))
+                        }}
+                        className="flex-1 bg-white border border-fal-gray-300 rounded p-2 text-xs text-fal-gray-900 font-mono"
+                      />
+                      <label className="btn-secondary text-xs cursor-pointer px-2 py-1">
+                        Upload
+                        <input
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0]
+                            if (!file) return
+                            const reader = new FileReader()
+                            reader.onload = (ev) => {
+                              const updated = [...ltx23ConditionConfig.character_refs]
+                              updated[idx] = { ...ref, image: ev.target?.result as string }
+                              setLtx23ConditionConfig(prev => ({ ...prev, character_refs: updated }))
+                            }
+                            reader.readAsDataURL(file)
+                          }}
+                        />
+                      </label>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <label className="text-xs text-fal-gray-600 w-20">Strength:</label>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={ref.strength}
+                        onChange={(e) => {
+                          const updated = [...ltx23ConditionConfig.character_refs]
+                          updated[idx] = { ...ref, strength: parseFloat(e.target.value) }
+                          setLtx23ConditionConfig(prev => ({ ...prev, character_refs: updated }))
+                        }}
+                        className="flex-1"
+                      />
+                      <span className="text-xs text-fal-gray-700 font-mono w-8">{ref.strength.toFixed(2)}</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const updated = ltx23ConditionConfig.character_refs.filter((_, i) => i !== idx)
+                      setLtx23ConditionConfig(prev => ({ ...prev, character_refs: updated }))
+                    }}
+                    className="text-fal-gray-400 hover:text-fal-red-500 text-lg font-bold"
+                    title="Remove character"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              {ltx23ConditionConfig.character_refs.length < 4 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLtx23ConditionConfig(prev => ({
+                      ...prev,
+                      character_refs: [
+                        ...prev.character_refs,
+                        { image: '', strength: 0.4, label: '' },
+                      ],
+                    }))
+                  }}
+                  className="btn-secondary text-sm w-full"
+                >
+                  + Add Character Reference
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Style Preset Selector (LTX 2.3 Local + Condition) */}
+        {(selectedModel === 'ltx-2.3-local' || selectedModel === 'ltx-2.3-condition') && (
           <div>
             <label className="metric-label mb-3 block">Style Preset</label>
             <div className="grid grid-cols-4 gap-2">
@@ -881,7 +1019,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                   type="button"
                   onClick={() => {
                     const PRESET_PARAMS: Record<string, Partial<LTX23LocalConfig>> = {
-                      cohesive:  { guidance_scale: 2.0, noise_scale: 0.03, llm_temperature: 0.4, mode: 'regular' },
+                      cohesive:  { guidance_scale: 2.0, noise_scale: 0.03, llm_temperature: 0.55, mode: 'regular' },
                       chaotic:   { guidance_scale: 3.0, noise_scale: 0.15, llm_temperature: 0.7, mode: 'regular' },
                       nightmare: { guidance_scale: 3.5, noise_scale: 0.20, llm_temperature: 0.9, mode: 'nightmare' },
                     }
@@ -908,8 +1046,8 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
           </div>
         )}
 
-        {/* Output Mode Selector (LTX 2.3 Local only) */}
-        {selectedModel === 'ltx-2.3-local' && (
+        {/* Output Mode Selector (LTX 2.3 Local + Condition) */}
+        {(selectedModel === 'ltx-2.3-local' || selectedModel === 'ltx-2.3-condition') && (
           <div>
             <label className="metric-label mb-3 block">Output Mode</label>
             <div className="grid grid-cols-2 gap-3">
@@ -949,6 +1087,8 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                 onClick={() => {
                   if (selectedModel === 'ltxv1') {
                     onStartTest({ ...ltxv1Config, initial_prompt: displayedPrompt })
+                  } else if (selectedModel === 'ltx-2.3-condition') {
+                    onStartTest({ ...ltx23ConditionConfig, initial_prompt: displayedPrompt })
                   } else if (selectedModel === 'ltx-2.3-local') {
                     onStartTest({ ...ltx23LocalConfig, initial_prompt: displayedPrompt })
                   } else {
@@ -974,7 +1114,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                   <Square className="w-4 h-4" />
                   <span>Stop Stream</span>
                 </button>
-                {onUpdateConfig && selectedModel === 'ltx-2.3-local' && (
+                {onUpdateConfig && (selectedModel === 'ltx-2.3-local' || selectedModel === 'ltx-2.3-condition') && (
                   <button
                     onClick={async () => {
                       setApplyStatus('applying')

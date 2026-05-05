@@ -115,6 +115,7 @@ class RealtimeGenerator(Monitorable):
     def __init__(self, load_local_pipeline: bool = False, load_ltx23_pipeline: bool = False):
         self.pipeline = None
         self.pipeline_v23 = None
+        self.pipeline_condition = None  # LTX2ConditionPipeline (shared transformer with pipeline_v23)
         self.load_local_pipeline = load_local_pipeline
         self.load_ltx23_pipeline = load_ltx23_pipeline
         # Set after the LTX 2.3 vocoder loads; used by the audio PCM path.
@@ -209,7 +210,40 @@ class RealtimeGenerator(Monitorable):
         print(f"🔊 Vocoder output sample rate: {self.audio_sample_rate} Hz")
 
         print("✅ LTX 2.3 distilled FP8 pipeline setup complete!")
-    
+
+        # Also load the condition pipeline (shares the same transformer + VAE,
+        # no extra VRAM).  This enables multi-image conditioning for character
+        # reference anchoring.
+        self._setup_ltx23_condition()
+
+    def _setup_ltx23_condition(self):
+        """Load LTX2ConditionPipeline sharing the transformer from pipeline_v23."""
+        import torch
+
+        if self.pipeline_v23 is None:
+            print("⚠️ Cannot load condition pipeline: pipeline_v23 not loaded")
+            return
+
+        try:
+            from diffusers import LTX2ConditionPipeline
+
+            print("🚀 Loading LTX 2.3 condition pipeline (shared transformer)...")
+            self.pipeline_condition = LTX2ConditionPipeline(
+                transformer=self.pipeline_v23.transformer,
+                vae=self.pipeline_v23.vae,
+                text_encoder=self.pipeline_v23.text_encoder,
+                tokenizer=self.pipeline_v23.tokenizer,
+                connectors=self.pipeline_v23.connectors,
+                scheduler=self.pipeline_v23.scheduler,
+                vocoder=self.pipeline_v23.vocoder,
+                audio_vae=self.pipeline_v23.audio_vae,
+            )
+            self.pipeline_condition.to("cuda")
+            print("✅ LTX 2.3 condition pipeline ready (shared weights, no extra VRAM)")
+        except Exception as e:
+            print(f"⚠️ Failed to load condition pipeline: {e}")
+            print("   ltx-2.3-condition model type will be unavailable")
+            self.pipeline_condition = None
 
     def decode_base64_image(self, base64_string: str) -> Image.Image:
         """Decode base64 string to PIL Image"""
@@ -369,9 +403,108 @@ class RealtimeGenerator(Monitorable):
         """Main entry point - routes to appropriate backend based on model_type"""
         if request.model_type == "ltx-2.3":
             return self.generate_video_with_fal_api(request)
+        if request.model_type == "ltx-2.3-condition":
+            return self.generate_video_with_condition_pipeline(request)
         if request.model_type == "ltx-2.3-local":
             return self.generate_video_with_local_v23(request)
         return self.generate_video_with_local_pipeline(request)
+
+    def generate_video_with_condition_pipeline(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
+        """Generate video using LTX2ConditionPipeline with multi-character reference anchoring."""
+        import random
+        import torch
+        import time
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+        from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
+
+        if self.pipeline_condition is None:
+            raise RuntimeError("LTX 2.3 condition pipeline not loaded.")
+
+        seed = request.seed if request.seed is not None else random.randrange(2**31)
+
+        print(f"🎬 Starting condition pipeline generation - {request.num_frames} frames")
+
+        input_image = self.decode_base64_image(request.image_base64)
+        input_image = input_image.resize((request.width, request.height))
+
+        # Build conditions: last frame for continuity + character references
+        conditions = [
+            LTX2VideoCondition(frames=input_image, index=0, strength=1.0),
+        ]
+
+        if request.character_refs:
+            for i, ref in enumerate(request.character_refs[:4]):
+                ref_image_data = ref.get("image", "")
+                ref_strength = float(ref.get("strength", 0.4))
+                ref_label = ref.get("label", f"ref_{i}")
+                if not ref_image_data:
+                    continue
+                try:
+                    ref_img = self.decode_base64_image(ref_image_data)
+                    ref_img = ref_img.resize((request.width, request.height))
+                    conditions.append(
+                        LTX2VideoCondition(frames=ref_img, index=0, strength=ref_strength)
+                    )
+                    print(f"   🧑 Character ref '{ref_label}': strength={ref_strength}")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to decode character ref '{ref_label}': {e}")
+
+        print(f"📏 Resolution: {request.width}x{request.height}")
+        print(f"📝 Prompt: {request.prompt[:80]}...")
+        print(f"🎚️ {len(conditions)} conditions, seed={seed}, guidance={request.guidance_scale}, noise={request.noise_scale}")
+
+        start_time = time.time()
+
+        # NOTE: do NOT pass noise_scale here.  In the condition pipeline,
+        # noise_scale controls how much noise is added to unconditioned regions
+        # and must be high (~1.0).  When omitted, it auto-infers from sigmas[0]
+        # which is the correct behavior.  The i2v pipeline uses noise_scale
+        # differently (latent interpolation), so the request.noise_scale value
+        # from the UI is not applicable here.
+        pipeline_kwargs = dict(
+            conditions=conditions,
+            prompt=request.prompt,
+            negative_prompt=request.negative_prompt,
+            width=request.width,
+            height=request.height,
+            num_frames=request.num_frames,
+            frame_rate=float(request.frame_rate),
+            num_inference_steps=8,
+            sigmas=DISTILLED_SIGMA_VALUES,
+            guidance_scale=request.guidance_scale,
+            modality_scale=1.0,
+            generator=torch.Generator(device="cuda").manual_seed(seed),
+            output_type="pil",
+            return_dict=False,
+        )
+
+        try:
+            video, audio = self.pipeline_condition(**pipeline_kwargs)
+
+            frames = video[0]
+
+            try:
+                audio_pcm = audio_tensor_to_pcm_bytes(
+                    audio,
+                    src_sample_rate=self.audio_sample_rate,
+                    dst_sample_rate=44100,
+                )
+                audio_seconds = len(audio_pcm) / (44100 * 2 * 2)
+                print(f"🔊 Audio PCM ready: {len(audio_pcm)} bytes ({audio_seconds:.2f}s)")
+            except Exception as e:
+                print(f"⚠️ Failed to convert audio: {e}")
+                audio_pcm = None
+
+            self.last_generation_time = time.time() - start_time
+            self.total_generation_time += self.last_generation_time
+            self.total_videos += 1
+
+            print(f"✅ Condition pipeline generation completed in {self.last_generation_time:.2f}s!")
+        except Exception as e:
+            print(f"❌ Condition pipeline generation failed: {e}")
+            raise
+
+        return LTXVideoResponseWithFrames(frames=frames, audio_pcm=audio_pcm)
 
     def generate_video_with_local_v23(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate video using local LTX 2.3 distilled FP8 pipeline"""

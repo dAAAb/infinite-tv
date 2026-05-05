@@ -19,7 +19,7 @@ class UpdateConfigRequest(BaseModel):
 
 class StartStreamRequest(BaseModel):
     # Model Selection
-    model: Optional[Literal["ltxv1", "ltx-2.3", "ltx-2.3-local"]] = Field(default="ltxv1", description="Which model to use for generation")
+    model: Optional[Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition"]] = Field(default="ltxv1", description="Which model to use for generation")
     
     # Basic stream configuration
     initial_prompt: Optional[str] = Field(default=None, description="Custom initial prompt for the stream")
@@ -65,6 +65,10 @@ class StartStreamRequest(BaseModel):
         description="Output backend: 'rtmp' pushes to Twitch via FFmpeg, 'webrtc' streams directly to browser via aiortc",
     )
     llm_temperature: Optional[float] = Field(default=0.7, description="LLM temperature for prompt generation (lower = more predictable, higher = more creative)")
+    character_refs: Optional[List[dict]] = Field(
+        default=None,
+        description="Character reference images [{image, strength, label}] for ltx-2.3-condition mode, max 4",
+    )
     style_preset: Optional[Literal["cohesive", "chaotic", "nightmare", "custom"]] = Field(
         default="cohesive",
         description="Named combination of system prompt + generation parameters. 'custom' uses the raw Advanced panel values.",

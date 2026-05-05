@@ -1,8 +1,5 @@
 // Shared types for the FAL Realtime Dashboard
 
-// Model types
-export type ModelType = 'ltxv1' | 'ltx-2.3' | 'ltx-2.3-local'
-
 // Component-specific metrics types
 export interface RTMPMetrics {
   queue_size: number
@@ -155,4 +152,16 @@ export interface LTX23LocalConfig {
   style_preset: 'cohesive' | 'chaotic' | 'nightmare' | 'custom'
 }
 
-export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig
+export interface CharacterRef {
+  image: string       // base64 data URI or HTTPS URL
+  strength: number    // 0-1, default 0.4
+  label: string       // display name, e.g. "Homer Simpson"
+}
+
+export interface LTX23ConditionConfig extends LTX23LocalConfig {
+  model: 'ltx-2.3-condition'
+  character_refs: CharacterRef[]
+}
+
+export type ModelType = 'ltxv1' | 'ltx-2.3' | 'ltx-2.3-local' | 'ltx-2.3-condition'
+export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig | LTX23ConditionConfig

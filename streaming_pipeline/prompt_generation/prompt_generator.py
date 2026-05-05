@@ -84,8 +84,18 @@ JSON Format (required):
 {{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "NEW action that CHANGES the story", "reasoning": "why this creates progression"}}"""
 
 PROMPT_COHESIVE = """\
-You are directing a continuous, cohesive animated video stream. Your job is to
-write the NEXT few seconds of the story -- not a new story.
+You are the writer and director of an ongoing animated story. The characters
+on screen are PROTAGONISTS with personalities, goals, and emotions. Your job
+is to write WHAT HAPPENS NEXT in their story.
+
+STORY PREMISE: {story_premise}
+CLIP NUMBER: {generation_count}
+
+AVAILABLE CHARACTERS:
+{character_cast}
+These characters exist in your story world. Bring them in naturally when the
+narrative calls for it -- not every character needs to be on screen at once.
+A character can enter, exit, be heard off-screen, or be referenced.
 
 CONTEXT:
 Recent story (last ~100 seconds): {previous_prompts}
@@ -96,58 +106,66 @@ CHAT COMMENTS:
 {chat_comments}
 
 VISUAL ANALYSIS:
-Briefly note what is visible in the current frame (characters, setting, action).
+Identify which characters are currently visible and what they are doing.
+These are story characters with intentions and reactions, not just objects.
 
-CORE PRINCIPLE: CONTINUITY FIRST
-The viewer should feel they are watching ONE continuous video, not a slideshow
-of unrelated clips. Every prompt must feel like the natural next 5-10 seconds
-of what is already happening.
+CHARACTER DIRECTION:
+- Use character NAMES in your prompts when they appear
+- Characters should WANT things, TRY things, REACT to things
+- They have emotions: curiosity, surprise, frustration, determination, joy
+- They interact with their environment and with EACH OTHER
+- They notice changes and respond to them
+- They make DECISIONS that drive the story forward
+- New characters ENTER scenes naturally (walk in, appear, are discovered)
 
-STORYTELLING RULES:
-1. CONTINUE the current scene -- same characters, same location, same mood
-2. Add SMALL developments: a character looks at something, picks up an object,
-   takes a step, a cloud passes, light shifts
-3. Change happens GRADUALLY: a walk becomes a jog over several prompts, not
-   an instant teleportation
-4. New elements (characters, objects) ENTER the scene naturally -- they walk
-   in, appear in the distance, are discovered behind something
-5. Location changes happen through TRANSITIONS: walking through a door,
-   turning a corner, a camera pan -- not instant cuts
+STORY RHYTHM (based on clip number):
+- Clips 1-3: ESTABLISH the scene. Show the character in their environment,
+  let the viewer understand who they are and where they are.
+- Clips 4-6: INTRODUCE a situation. Something catches the character's attention.
+  A sound, a light, an object, a change in the environment.
+- Clips 7-10: DEVELOP tension. The character investigates, tries something,
+  encounters a problem or discovery. Stakes should rise.
+- Clips 11-15: ESCALATE. Things get more interesting -- the character must
+  react to consequences, make a choice, or deal with something unexpected.
+- Clips 16+: RESOLVE and RESET. The situation reaches a peak, then a new
+  situation begins. New cycle starts.
+
+CONTINUITY RULES:
+1. Same characters, same location (unless transitioning naturally)
+2. Each prompt flows from the previous one -- no teleportation
+3. New elements enter NATURALLY (walk in, appear in background, are discovered)
+4. Transitions through doors, corridors, camera movement -- not cuts
 
 WHEN CHAT COMMENTS EXIST:
 1. Pick the most interesting comment
-2. Work it INTO the current scene naturally (the character reacts to it,
-   something related appears in the background)
-3. Don't abandon the scene -- ADAPT it to include the comment
-4. If the comment is wild, have the character REACT to it rather than
-   teleporting to a new scene
+2. Make it something the CHARACTER encounters or reacts to within the story
+3. Don't break the scene -- WEAVE the comment into the narrative
 
 WHEN NO COMMENTS:
-1. Continue the current action with a small development
-2. Add subtle environmental changes (wind, lighting, background movement)
-3. Have the character do the NEXT logical thing
-4. Only introduce new elements if the scene has been truly static for 5+ prompts
+1. Follow the STORY RHYTHM above based on the current clip number
+2. Give the character something to DO, not just something to look at
+3. Build toward the next beat in the rhythm
 
 STYLE:
-- Describe continuous motion, not static scenes
-- Use "continues to", "slowly", "gradually", "begins to" for smooth transitions
-- Include camera direction when helpful ("camera slowly pans left to reveal...")
+- Write what the CHARACTER DOES, not what the camera sees
+- Action verbs: notices, reaches for, stumbles, discovers, recoils, grins
+- Include character emotion/reaction when relevant
 - Under 120 characters
 - Present tense, active voice
 
 MODE INSTRUCTIONS:
-If mode is "nightmare": Gradually introduce unsettling elements -- shadows
-lengthen, colors shift, familiar objects subtly distort. Build dread slowly
-rather than instant chaos.
+If mode is "nightmare": Gradually introduce unsettling elements. Objects subtly
+wrong, shadows that move, familiar things becoming alien. The character starts
+to notice something is off. Build dread through the character's growing unease.
 
 CRITICAL: Respond with VALID JSON ONLY.
 JSON Format:
-{{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "next few seconds of the SAME scene", "reasoning": "how this continues the story"}}"""
+{{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "what the character DOES next in the story", "reasoning": "how this advances the story rhythm"}}"""
 
 STYLE_PRESETS = {
     "cohesive": {
         "prompt": PROMPT_COHESIVE,
-        "temperature": 0.4,
+        "temperature": 0.55,
     },
     "chaotic": {
         "prompt": PROMPT_CHAOTIC,
@@ -229,13 +247,32 @@ class PromptGenerator(Monitorable):
         else:
             comment_text = "None"
         
-        # Create base system prompt
-        formatted_prompt = self.system_prompt.format(
+        # Build template variables.  story_premise and generation_count are
+        # used by the cohesive prompt but ignored (via **kwargs-style) by the
+        # chaotic prompt which doesn't have those placeholders.
+        story_premise = context.previous_prompts[0] if context.previous_prompts else "an animated story"
+
+        # Build character cast description for the LLM
+        if context.character_names:
+            character_cast = "\n".join(f"- {name}" for name in context.character_names)
+        else:
+            character_cast = "- (No specific characters defined -- use whatever characters appear in the scene)"
+
+        template_vars = dict(
             previous_prompts=context.previous_prompts[-self.CONTEXT_WINDOW_SIZE:] if context.previous_prompts else ["None"],
             current_scene=context.current_scene,
             chat_comments=comment_text,
-            mode=context.mode
+            mode=context.mode,
+            story_premise=story_premise,
+            generation_count=context.generation_count,
+            character_cast=character_cast,
         )
+        # Only pass vars that exist in the template to avoid KeyError on
+        # prompts that don't use all variables.
+        import re
+        template_keys = set(re.findall(r'\{(\w+)\}', self.system_prompt))
+        filtered_vars = {k: v for k, v in template_vars.items() if k in template_keys}
+        formatted_prompt = self.system_prompt.format(**filtered_vars)
         
         # Select model and client
         model, client = self._select_model_and_client(context)

@@ -42,13 +42,21 @@ class StreamingState:
     
     # Generation mode and context
     mode: str = "regular"
-    
+
+    # Character references for condition pipeline (set once at stream start)
+    character_refs: List[Dict] = None  # [{image, strength, label}, ...]
+    character_names: List[str] = None  # just the labels, for the LLM prompt
+
     # Generation history and context
     previous_prompts: List[str] = None
-    
+
     def __post_init__(self):
         if self.previous_prompts is None:
             self.previous_prompts = []
+        if self.character_refs is None:
+            self.character_refs = []
+        if self.character_names is None:
+            self.character_names = []
     
     @property
     def current_scene(self) -> str:

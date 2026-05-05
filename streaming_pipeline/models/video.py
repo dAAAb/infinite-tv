@@ -6,7 +6,7 @@ from fal.toolkit.file import File
 class LTXVideoRequestI2V(BaseModel):
     prompt: str = Field(description="The prompt to generate the video")
     image_base64: str = Field(description="Base64 encoded input image")
-    model_type: Literal["ltxv1", "ltx-2.3", "ltx-2.3-local"] = Field(default="ltxv1", description="Which model to use for generation")
+    model_type: Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition"] = Field(default="ltxv1", description="Which model to use for generation")
     negative_prompt: str = Field(
         default="worst quality, inconsistent motion, blurry, jittery, distorted, static scene, frozen frame, no motion, repetitive, looping",
         description="The negative prompt",
@@ -29,6 +29,13 @@ class LTXVideoRequestI2V(BaseModel):
     spatio_temporal_guidance_blocks: Optional[List[int]] = Field(default=None, description="Transformer block indices at which to apply STG (required when stg_scale>0)")
     noise_scale: float = Field(default=0.15, description="Noise injected into latents during denoising; breaks deterministic loops (0-0.3)")
     seed: Optional[int] = Field(default=None, description="Generation seed. If null, a random seed is used per generation")
+
+    # LTX 2.3 Condition pipeline: character reference images
+    # Each entry: {"image": "base64_or_url", "strength": 0.4, "label": "Homer Simpson"}
+    character_refs: Optional[List[dict]] = Field(
+        default=None,
+        description="Character reference images for identity anchoring (max 4). Each: {image, strength, label}",
+    )
 
     # LTX 2.3-specific parameters
     duration: Optional[Literal[6, 8, 10, 12, 14, 16, 18, 20]] = Field(default=None, description="Duration in seconds (>10s requires 25fps and 1080p)")

@@ -412,8 +412,12 @@ class RealtimeVideoStreamer(Monitorable):
             request_dict = self.ltx_config.dict()
             request_dict.update({
                 "prompt": prompt_to_use,
-                "image_base64": self.state.current_frame_base64
+                "image_base64": self.state.current_frame_base64,
             })
+
+            # Pass character references for the condition pipeline
+            if self.ltx_config.model_type == "ltx-2.3-condition" and self.state.character_refs:
+                request_dict["character_refs"] = self.state.character_refs
 
             if used_comment:
                 comment_params = UserCommentParams()

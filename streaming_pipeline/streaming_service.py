@@ -226,6 +226,19 @@ class StreamingService:
             # Hot-swap the streamer reference on the video_streamer
             self.video_streamer.rtmp_streamer = active_streamer
             
+            # Store character references for condition pipeline
+            if getattr(request, "character_refs", None):
+                self.video_streamer.state.character_refs = request.character_refs[:4]
+                self.video_streamer.state.character_names = [
+                    ref.get("label", f"Character {i+1}")
+                    for i, ref in enumerate(request.character_refs[:4])
+                    if ref.get("label")
+                ]
+                print(f"   🧑 Character refs: {', '.join(self.video_streamer.state.character_names) or 'unnamed'}")
+            else:
+                self.video_streamer.state.character_refs = []
+                self.video_streamer.state.character_names = []
+
             # Set custom initial state if provided
             if request.initial_prompt or request.initial_image_url:
                 print(f"🎨 Using custom initial state:")
