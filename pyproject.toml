@@ -31,5 +31,9 @@ dependencies = [
 ]
 
 
+[tool.setuptools.packages.find]
+include = ["streaming_pipeline*"]
+exclude = ["logs*", "dashboard*", "venv*"]
+
 [tool.fal.apps]
 "realtime-streaming" = { auth = "private", ref = "streaming_pipeline/app.py::RealtimeStreamingApp" }

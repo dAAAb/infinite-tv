@@ -42,14 +42,22 @@ class StreamingService:
         twitch_channel = os.getenv("TWITCH_CHANNEL", "shroud")
         openai_key = os.getenv("OPENAI_API_KEY")
         groq_key = os.getenv("GROQ_API_KEY")
+        fal_key = os.getenv("FAL_KEY")
         stream_key = os.getenv("TWITCH_STREAM_KEY")
-        
-        if not openai_key:
-            raise ValueError("OPENAI_API_KEY environment variable required")
+
+        if not (fal_key or openai_key or groq_key):
+            raise ValueError(
+                "At least one of FAL_KEY, OPENAI_API_KEY, or GROQ_API_KEY "
+                "must be set for prompt generation."
+            )
 
         # Create all dependencies independently (Dependency Injection pattern)
         self.twitch_listener = TwitchChatListener(twitch_channel)
-        self.prompt_generator = PromptGenerator(openai_key, groq_key)
+        self.prompt_generator = PromptGenerator(
+            openai_api_key=openai_key,
+            groq_api_key=groq_key,
+            fal_key=fal_key,
+        )
 
         # RTMP streamer (requires TWITCH_STREAM_KEY; optional for webrtc-only)
         if stream_key:

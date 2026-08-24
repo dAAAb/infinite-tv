@@ -1,4 +1,5 @@
 import json
+import os
 import openai
 import requests
 import base64
@@ -6,6 +7,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 from streaming_pipeline.models import TwitchComment
 from streaming_pipeline.models import StreamingState, Monitorable
+
+FAL_OPENROUTER_BASE_URL = "https://fal.run/openrouter/router/openai/v1"
+FAL_OPENROUTER_DEFAULT_VISION_MODEL = "openai/gpt-4o-mini"
+FAL_OPENROUTER_DEFAULT_TEXT_MODEL = "openai/gpt-4o-mini"
 
 @dataclass
 class PromptResult:
@@ -184,22 +189,61 @@ system_prompt = PROMPT_CHAOTIC if VISUAL_MODE else PROMPT_CHAOTIC
 class PromptGenerator(Monitorable):
     CONTEXT_WINDOW_SIZE = 10
     USE_GROQ = True
+    # When FAL_KEY is available, route through fal's OpenRouter proxy first
+    # so all LLM usage is billed via the fal account instead of requiring
+    # separate OpenAI/Groq keys.
+    USE_FAL_OPENROUTER = True
 
-    def __init__(self, openai_api_key: str, groq_api_key: str = None):
-        self.openai_client = openai.OpenAI(api_key=openai_api_key)
+    def __init__(
+        self,
+        openai_api_key: Optional[str] = None,
+        groq_api_key: Optional[str] = None,
+        fal_key: Optional[str] = None,
+    ):
         self.system_prompt = system_prompt
         self.temperature = 0.7
         self.VISUAL_MODE = VISUAL_MODE
+
+        self.openai_client = (
+            openai.OpenAI(api_key=openai_api_key) if openai_api_key else None
+        )
+
         if groq_api_key and self.USE_GROQ:
             self.groq_client = openai.OpenAI(
                 api_key=groq_api_key,
-                base_url="https://api.groq.com/openai/v1"
+                base_url="https://api.groq.com/openai/v1",
             )
             print("🚀 Groq client initialized for fast inference")
         else:
             self.groq_client = None
-            if self.USE_GROQ:
-                print("⚠️ USE_GROQ=True but no GROQ_API_KEY provided, falling back to OpenAI")
+
+        if fal_key and self.USE_FAL_OPENROUTER:
+            # fal expects `Authorization: Key <FAL_KEY>`, not the standard
+            # `Bearer` header the openai SDK would send, so we override
+            # default_headers instead of using api_key.
+            self.fal_openrouter_client = openai.OpenAI(
+                api_key="not-needed",
+                base_url=FAL_OPENROUTER_BASE_URL,
+                default_headers={"Authorization": f"Key {fal_key}"},
+            )
+            print("🛰️  fal→OpenRouter client initialized (billed via FAL_KEY)")
+        else:
+            self.fal_openrouter_client = None
+
+        if not any([self.fal_openrouter_client, self.groq_client, self.openai_client]):
+            raise ValueError(
+                "PromptGenerator requires at least one of FAL_KEY, "
+                "GROQ_API_KEY, or OPENAI_API_KEY to be set."
+            )
+
+        # Model slugs used against fal→OpenRouter. Override via env if you
+        # want to swap in Claude, Gemini, Llama, etc. (any OpenRouter slug).
+        self.fal_vision_model = os.getenv(
+            "FAL_OPENROUTER_VISION_MODEL", FAL_OPENROUTER_DEFAULT_VISION_MODEL
+        )
+        self.fal_text_model = os.getenv(
+            "FAL_OPENROUTER_TEXT_MODEL", FAL_OPENROUTER_DEFAULT_TEXT_MODEL
+        )
 
         self.total_prompts = 0
         self.total_response_time = 0.0
@@ -218,25 +262,43 @@ class PromptGenerator(Monitorable):
         print(f"🎨 Style preset '{name}': temperature={self.temperature}")
     
     def _select_model_and_client(self, context):
-        """Select optimal model and client based on requirements"""
-        
+        """Select optimal model and client based on requirements.
+
+        Preference order:
+          1. fal → OpenRouter (unified billing via FAL_KEY)
+          2. Groq (fastest inference, when GROQ_API_KEY is set)
+          3. OpenAI direct
+        """
+        needs_vision = self.VISUAL_MODE and context.current_frame_base64
+
+        if self.fal_openrouter_client:
+            model = self.fal_vision_model if needs_vision else self.fal_text_model
+            label = "vision" if needs_vision else "text"
+            print(f"🛰️  Using fal→OpenRouter {label} model: {model}")
+            return model, self.fal_openrouter_client
+
         if self.USE_GROQ and self.groq_client:
-            if self.VISUAL_MODE and context.current_frame_base64:
-                # Use Groq's Llama 4 Scout for vision - fast and capable!
+            if needs_vision:
                 print("🖼️ Using Groq Llama 4 Scout for FAST vision inference")
                 return "meta-llama/llama-4-scout-17b-16e-instruct", self.groq_client
-            else:
-                # Use FASTEST text model for non-vision
-                print("⚡ Using Groq llama-3.1-8b-instant for MAXIMUM SPEED")
-                return "llama-3.1-8b-instant", self.groq_client
-        
-        # Fallback to OpenAI only if Groq not available
-        elif self.VISUAL_MODE and context.current_frame_base64:
-            print("🔄 Falling back to OpenAI GPT-4o for vision")
-            return "gpt-4o", self.openai_client
-        else:
+            print("⚡ Using Groq llama-3.1-8b-instant for MAXIMUM SPEED")
+            return "llama-3.1-8b-instant", self.groq_client
+
+        if self.openai_client:
+            if needs_vision:
+                print("🔄 Falling back to OpenAI GPT-4o for vision")
+                return "gpt-4o", self.openai_client
             print("🔄 Falling back to OpenAI GPT-4o-mini")
             return "gpt-4o-mini", self.openai_client
+
+        raise RuntimeError("No LLM client available for prompt generation")
+
+    def _provider_label(self, client) -> str:
+        if client is self.fal_openrouter_client:
+            return "fal→OpenRouter"
+        if client is self.groq_client:
+            return "Groq"
+        return "OpenAI"
 
     def generate_prompt(self, comments: List[TwitchComment], context: StreamingState) -> PromptResult:
         """Generate prompt with Groq for both text and vision"""
@@ -276,8 +338,9 @@ class PromptGenerator(Monitorable):
         
         # Select model and client
         model, client = self._select_model_and_client(context)
-        
-        print(f"🤖 Using {model} ({'Groq' if client == self.groq_client else 'OpenAI'}) for prompt generation")
+        provider_label = self._provider_label(client)
+
+        print(f"🤖 Using {model} ({provider_label}) for prompt generation")
         
         # Prepare messages
         messages = [{"role": "system", "content": formatted_prompt}]
@@ -305,11 +368,16 @@ class PromptGenerator(Monitorable):
                     ]
                 }
                 messages.append(user_message)
-                print(f"🖼️ Using {'Groq' if client == self.groq_client else 'OpenAI'} vision model")
+                print(f"🖼️ Using {provider_label} vision model")
             except Exception as e:
                 print(f"⚠️ Failed to add visual context: {e}")
                 # Fallback to text-only with same client
-                model = "llama-3.1-70b-versatile" if client == self.groq_client else "gpt-4o-mini"
+                if client == self.fal_openrouter_client:
+                    model = self.fal_text_model
+                elif client == self.groq_client:
+                    model = "llama-3.1-70b-versatile"
+                else:
+                    model = "gpt-4o-mini"
         
         # Track input size and start timing
         input_text = formatted_prompt + comment_text
@@ -337,7 +405,12 @@ class PromptGenerator(Monitorable):
                     print(f"⚠️ Rate limit hit, retrying text-only without image...")
                     text_only_messages = [m for m in messages if m.get("role") == "system"]
                     text_only_messages.append({"role": "user", "content": comment_text or "Generate the next video prompt following the system instructions."})
-                    text_only_model = "llama-3.1-8b-instant" if client == self.groq_client else "gpt-4o-mini"
+                    if client == self.fal_openrouter_client:
+                        text_only_model = self.fal_text_model
+                    elif client == self.groq_client:
+                        text_only_model = "llama-3.1-8b-instant"
+                    else:
+                        text_only_model = "gpt-4o-mini"
                     response = client.chat.completions.create(
                         model=text_only_model,
                         messages=text_only_messages,
