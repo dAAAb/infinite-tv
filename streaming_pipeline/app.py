@@ -19,7 +19,11 @@ requirements = [
     "torchvision==0.22.1+cu128",
     "torchaudio==2.7.1+cu128",  # Used to resample LTX 2.3 vocoder output for native audio streaming
     "aiortc==1.14.0",  # WebRTC for Python -- used by WebRTCStreamer for direct-to-browser streaming
-    "git+https://github.com/huggingface/diffusers.git@main",
+    # Pinned to a released version instead of git main: diffusers 0.40.0 bumped
+    # to huggingface-hub>=1.23 which conflicts with the transformers<4.52 /
+    # huggingface-hub~=0.30 pins below. 0.39.0 is the newest release that has
+    # LTX2ImageToVideoPipeline (added in 0.37.0) and still allows hub<1.0.
+    "diffusers==0.39.0",
     "transformers>=4.47.2,<4.52.0",
     "sentencepiece>=0.1.96",
     "huggingface-hub~=0.30",

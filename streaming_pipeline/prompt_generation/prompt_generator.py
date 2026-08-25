@@ -9,8 +9,13 @@ from streaming_pipeline.models import TwitchComment
 from streaming_pipeline.models import StreamingState, Monitorable
 
 FAL_OPENROUTER_BASE_URL = "https://fal.run/openrouter/router/openai/v1"
-FAL_OPENROUTER_DEFAULT_VISION_MODEL = "openai/gpt-4o-mini"
-FAL_OPENROUTER_DEFAULT_TEXT_MODEL = "openai/gpt-4o-mini"
+# Defaults benchmarked on the fal proxy (Aug 2026): gemini-2.5-flash was the
+# fastest and most consistent option (~1.25s per prompt-gen call, served by
+# Google), with reliable JSON-mode + vision support. fal disallows per-request
+# provider selection, so we can't force a Groq/Cerebras route through this
+# proxy -- keep GROQ_API_KEY set if you need sub-second prompt latency.
+FAL_OPENROUTER_DEFAULT_VISION_MODEL = "google/gemini-2.5-flash"
+FAL_OPENROUTER_DEFAULT_TEXT_MODEL = "google/gemini-2.5-flash"
 
 @dataclass
 class PromptResult:
