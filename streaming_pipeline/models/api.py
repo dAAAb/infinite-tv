@@ -19,7 +19,7 @@ class UpdateConfigRequest(BaseModel):
 
 class StartStreamRequest(BaseModel):
     # Model Selection
-    model: Optional[Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition"]] = Field(default="ltxv1", description="Which model to use for generation")
+    model: Optional[Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition", "h3-max"]] = Field(default="ltxv1", description="Which model to use for generation")
     
     # Basic stream configuration
     initial_prompt: Optional[str] = Field(default=None, description="Custom initial prompt for the stream")
@@ -55,6 +55,11 @@ class StartStreamRequest(BaseModel):
     duration: Optional[Literal[6, 8, 10, 12, 14, 16, 18, 20]] = Field(default=None, description="Duration in seconds (>10s requires 25fps and 1080p)")
     resolution: Optional[Literal["1080p", "1440p", "2160p"]] = Field(default=None, description="Resolution for LTX 2.3")
     aspect_ratio: Optional[Literal["auto", "16:9", "9:16"]] = Field(default=None, description="Aspect ratio for LTX 2.3")
+
+    # H3 Max (minimax/h3-max) API parameters
+    h3_duration: Optional[int] = Field(default=None, ge=5, le=15, description="H3 Max clip duration in seconds (5-15, default 15)")
+    h3_resolution: Optional[Literal["480P", "768P"]] = Field(default=None, description="H3 Max render resolution (default 480P)")
+    h3_prompt_expansion_mode: Optional[Literal["balanced", "disabled"]] = Field(default=None, description="fal prompt expansion for H3 Max (default 'balanced')")
 
     # Streaming Configuration
     target_fps: Optional[float] = Field(default=9.0, description="Target streaming FPS")

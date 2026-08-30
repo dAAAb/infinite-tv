@@ -163,5 +163,21 @@ export interface LTX23ConditionConfig extends LTX23LocalConfig {
   character_refs: CharacterRef[]
 }
 
-export type ModelType = 'ltxv1' | 'ltx-2.3' | 'ltx-2.3-local' | 'ltx-2.3-condition'
-export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig | LTX23ConditionConfig
+// H3 Max (minimax/h3-max) configuration - API-hosted, 24 fps, native audio.
+// No GPU parameters: generation happens behind the fal Model API.
+export interface H3MaxConfig {
+  model: 'h3-max'
+  initial_prompt: string
+  initial_image_url: string
+  h3_duration: number                          // 5-15 seconds per clip
+  h3_resolution: '480P' | '768P'
+  h3_prompt_expansion_mode: 'balanced' | 'disabled'
+  target_fps: number                           // keep at 24 = H3's native clip rate
+  width: number
+  height: number
+  enable_audio: boolean
+  output_mode: 'rtmp' | 'webrtc'
+}
+
+export type ModelType = 'ltxv1' | 'ltx-2.3' | 'ltx-2.3-local' | 'ltx-2.3-condition' | 'h3-max'
+export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig | LTX23ConditionConfig | H3MaxConfig

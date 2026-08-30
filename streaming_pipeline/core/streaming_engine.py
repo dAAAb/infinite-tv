@@ -192,13 +192,15 @@ class RealtimeVideoStreamer(Monitorable):
             print("⚠️ Already running")
             return
         
-        # Auto-set initial state if not already set
-        if not self.state.current_frame_base64:
-            print(f"🖼️ Loading initial image from: {self.initial_image_url}")
-            initial_image_base64 = self._url_to_base64(self.initial_image_url)
-            self.state.current_frame_base64 = initial_image_base64
-            self.state.current_prompt = self.initial_prompt
-            self.state.previous_prompts = [self.initial_prompt]
+        # Always re-seed from the requested initial image. The runner process
+        # is long-lived (keep_alive), so state.current_frame_base64 still
+        # holds the LAST session's final frame - seeding only-when-empty made
+        # every warm start silently resume the previous stream's imagery.
+        print(f"🖼️ Loading initial image from: {self.initial_image_url}")
+        initial_image_base64 = self._url_to_base64(self.initial_image_url)
+        self.state.current_frame_base64 = initial_image_base64
+        self.state.current_prompt = self.initial_prompt
+        self.state.previous_prompts = [self.initial_prompt]
         
         generation_log.info(f"🎬 Starting realtime video streaming...")
         generation_log.info(f"📺 Twitch channel: #{self.twitch_listener.channel_name}")
@@ -277,6 +279,23 @@ class RealtimeVideoStreamer(Monitorable):
 
         while self.state.is_running:
             try:
+                # Backpressure: H3 generates faster than realtime, and the
+                # frame queue silently drops frames once full while audio
+                # keeps queueing (= progressive A/V desync). Hold the next
+                # generation - and its prompt task, so chat direction stays
+                # fresh - until buffered runway drops below ~360 frames
+                # (~15s at 24fps). Slower-than-realtime backends never gate.
+                frame_queue = getattr(self.rtmp_streamer, "frame_queue", None)
+                while (
+                    self.state.is_running
+                    and not first_generation
+                    and frame_queue is not None
+                    and frame_queue.qsize() > 360
+                ):
+                    await asyncio.sleep(0.5)
+                if not self.state.is_running:
+                    break
+
                 # For first generation, don't start prompt generation task
                 if not first_generation:
                     # Start prompt generation for NEXT video (sequential with current frame)

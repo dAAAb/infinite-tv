@@ -113,6 +113,18 @@ class StreamingService:
             self.setup()
             
         try:
+            # Refuse a start while a stream is live: reconfiguring a running
+            # engine half-applies the new settings and the engine's own start
+            # is a silent no-op, so the old stream keeps going with the old
+            # model and the caller still sees "started". Stop first.
+            if self.video_streamer and self.video_streamer.state.is_running:
+                running_model = self.video_streamer.ltx_config.model_type
+                print(f"⚠️ start_stream refused: a stream is already running (model: {running_model})")
+                return {
+                    "status": "error",
+                    "message": f"A stream is already running (model: {running_model}). Stop it first, then start again.",
+                    "model": running_model,
+                }
 
             # Update LTX configuration cleanly using the base model
             ltx_updates = {}
@@ -166,6 +178,29 @@ class StreamingService:
             if request.aspect_ratio:
                 ltx_updates['aspect_ratio'] = request.aspect_ratio
                 print(f"   📏 Aspect Ratio: {request.aspect_ratio}")
+
+            # H3 Max-specific parameters
+            if request.model == "h3-max":
+                if getattr(request, "h3_duration", None) is not None:
+                    ltx_updates['h3_duration'] = request.h3_duration
+                    print(f"   ⏱️ H3 duration: {request.h3_duration}s")
+                if getattr(request, "h3_resolution", None):
+                    ltx_updates['h3_resolution'] = request.h3_resolution
+                    print(f"   📐 H3 resolution: {request.h3_resolution}")
+                if getattr(request, "h3_prompt_expansion_mode", None):
+                    ltx_updates['h3_prompt_expansion_mode'] = request.h3_prompt_expansion_mode
+                    print(f"   ✍️ H3 prompt expansion: {request.h3_prompt_expansion_mode}")
+                # H3 renders 24 fps clips natively; pacing them at the default
+                # 9 fps would play everything in slow motion. Snap to 24
+                # unless the user explicitly picked another rate.
+                if request.target_fps is None or float(request.target_fps) == 9.0:
+                    request.target_fps = 24.0
+                    print(f"   🎞️ h3-max: target_fps snapped to 24 (native clip rate)")
+                # frame_rate must land in THIS apply (the later frame_rate
+                # assignment happens after update_ltx_config has already run)
+                # so the H3 audio-fit math sees the real playback rate.
+                ltx_updates['frame_rate'] = float(request.frame_rate or request.target_fps)
+
             # Apply style preset (system prompt + generation param overrides).
             # Must happen BEFORE ltx_updates are applied so preset params
             # get merged, and before the generation loop starts.
@@ -278,13 +313,17 @@ class StreamingService:
             
             return {
                 "status": "started",
-                "message": f"Streaming started ({output_mode} mode).",
+                "message": f"Streaming started ({output_mode} mode, model: {self.video_streamer.ltx_config.model_type}).",
+                "model": self.video_streamer.ltx_config.model_type,
                 "output_mode": output_mode,
                 "twitch_channel_input": self.video_streamer.twitch_listener.channel_name,
                 "rtmp_url": self.rtmp_streamer.rtmp_url if self.rtmp_streamer else None,
                 "initial_prompt": self.video_streamer.initial_prompt,
                 "initial_image_url": self.video_streamer.initial_image_url,
                 "configuration": {
+                    "model_type": self.video_streamer.ltx_config.model_type,
+                    "h3_duration": self.video_streamer.ltx_config.h3_duration,
+                    "h3_resolution": self.video_streamer.ltx_config.h3_resolution,
                     "num_frames": self.video_streamer.ltx_config.num_frames,
                     "timesteps": self.video_streamer.ltx_config.timesteps,
                     "target_fps": active_streamer.fps,

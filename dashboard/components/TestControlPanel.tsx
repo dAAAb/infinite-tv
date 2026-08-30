@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react'
 import { Play, Square, Upload, Settings, Sliders, Zap, RefreshCw } from 'lucide-react'
-import type { TestConfig, LTXv1Config, LTXv2Config, LTX23LocalConfig, LTX23ConditionConfig, CharacterRef, ModelType } from '../types'
+import type { TestConfig, LTXv1Config, LTXv2Config, LTX23LocalConfig, LTX23ConditionConfig, H3MaxConfig, CharacterRef, ModelType } from '../types'
 
 interface TestControlPanelProps {
   onStartTest: (config: TestConfig) => void
@@ -100,6 +100,22 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
     character_refs: [],
   })
 
+  const [h3Config, setH3Config] = useState<H3MaxConfig>({
+    model: 'h3-max',
+    initial_prompt: "A cinematic video with smooth camera movement, realistic motion and ambient sound",
+    initial_image_url: "https://scriptmag.com/uploads/MTY3Mzc4OTYwMzA5ODg4NjI0/image-placeholder-title.jpg?format=auto&optimize=high&width=1440",
+    h3_duration: 10,
+    h3_resolution: '480P',
+    h3_prompt_expansion_mode: 'balanced',
+    // H3 clips are 24 fps natively; stream at 24 so they play at speed
+    target_fps: 24.0,
+    // Decode upscales 480P output to a platform-friendly 720p stream
+    width: 1280,
+    height: 720,
+    enable_audio: true,
+    output_mode: 'rtmp',
+  })
+
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [uploadingImage, setUploadingImage] = useState(false)
   const [applyStatus, setApplyStatus] = useState<'idle' | 'applying' | 'applied'>('idle')
@@ -120,17 +136,19 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
   const fileInputRef = useRef<HTMLInputElement>(null)
   
   // Get current config based on selected model
-  const config = selectedModel === 'ltxv1' ? ltxv1Config 
+  const config = selectedModel === 'ltxv1' ? ltxv1Config
     : selectedModel === 'ltx-2.3-condition' ? ltx23ConditionConfig
-    : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig 
+    : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig
+    : selectedModel === 'h3-max' ? h3Config
     : ltxv2Config
-  
+
   // Computed prompt value that includes nightmare prefix when needed (LTXv1 only)
   const displayedPrompt = selectedModel === 'ltxv1' && ltxv1Config.mode === 'nightmare' && !ltxv1Config.initial_prompt.startsWith('(Nightmare Started)')
     ? `(Nightmare Started) ${ltxv1Config.initial_prompt}`
-    : selectedModel === 'ltxv1' ? ltxv1Config.initial_prompt 
+    : selectedModel === 'ltxv1' ? ltxv1Config.initial_prompt
     : selectedModel === 'ltx-2.3-condition' ? ltx23ConditionConfig.initial_prompt
     : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_prompt
+    : selectedModel === 'h3-max' ? h3Config.initial_prompt
     : ltxv2Config.prompt
 
   const handleImageUpload = async (file: File) => {
@@ -158,6 +176,10 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
           setLtxv1Config(prev => ({ ...prev, initial_image_url: result }))
         } else if (selectedModel === 'ltx-2.3-local') {
           setLtx23LocalConfig(prev => ({ ...prev, initial_image_url: result }))
+        } else if (selectedModel === 'ltx-2.3-condition') {
+          setLtx23ConditionConfig(prev => ({ ...prev, initial_image_url: result }))
+        } else if (selectedModel === 'h3-max') {
+          setH3Config(prev => ({ ...prev, initial_image_url: result }))
         } else {
           setLtxv2Config(prev => ({ ...prev, image_url: result }))
         }
@@ -270,6 +292,22 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
               </div>
               <p className="text-xs mt-1 opacity-75">Multi-character refs</p>
             </button>
+
+            <button
+              type="button"
+              onClick={() => setSelectedModel('h3-max')}
+              className={`px-4 py-3 rounded-lg text-sm font-medium transition-all border-2 ${
+                selectedModel === 'h3-max'
+                  ? 'bg-fal-primary-500 text-white border-fal-primary-500 shadow-lg'
+                  : 'bg-white text-fal-gray-700 hover:bg-fal-gray-50 border-fal-gray-300'
+              }`}
+            >
+              <div className="flex items-center justify-center space-x-2">
+                <Zap className="w-4 h-4" />
+                <span>H3 Max</span>
+              </div>
+              <p className="text-xs mt-1 opacity-75">API · 24fps · native audio</p>
+            </button>
           </div>
         </div>
 
@@ -293,6 +331,8 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                     setLtxv1Config(prev => ({ ...prev, initial_prompt: newPrompt }))
                   } else if (selectedModel === 'ltx-2.3-local') {
                     setLtx23LocalConfig(prev => ({ ...prev, initial_prompt: newPrompt }))
+                  } else if (selectedModel === 'h3-max') {
+                    setH3Config(prev => ({ ...prev, initial_prompt: newPrompt }))
                   } else {
                     setLtxv2Config(prev => ({ ...prev, prompt: newPrompt }))
                   }
@@ -465,17 +505,17 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                   className={`relative border-2 border-dashed rounded-lg transition-all ${
                     uploadingImage 
                       ? 'border-fal-primary-400 bg-fal-primary-50' 
-                      : (selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : ltxv2Config.image_url)
+                      : (selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : selectedModel === 'ltx-2.3-condition' ? ltx23ConditionConfig.initial_image_url : selectedModel === 'h3-max' ? h3Config.initial_image_url : ltxv2Config.image_url)
                         ? 'border-fal-gray-300 bg-fal-gray-50' 
                         : 'border-fal-gray-300 bg-fal-gray-100 hover:border-fal-primary-400 hover:bg-fal-primary-50 cursor-pointer'
                   }`}
                   onClick={() => !uploadingImage && fileInputRef.current?.click()}
                 >
-                  {(selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : ltxv2Config.image_url) ? (
+                  {(selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : selectedModel === 'ltx-2.3-condition' ? ltx23ConditionConfig.initial_image_url : selectedModel === 'h3-max' ? h3Config.initial_image_url : ltxv2Config.image_url) ? (
                     // Image Preview State - Click to replace
                     <div className="relative group cursor-pointer">
                       <img
-                        src={selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : ltxv2Config.image_url}
+                        src={selectedModel === 'ltxv1' ? ltxv1Config.initial_image_url : selectedModel === 'ltx-2.3-local' ? ltx23LocalConfig.initial_image_url : selectedModel === 'ltx-2.3-condition' ? ltx23ConditionConfig.initial_image_url : selectedModel === 'h3-max' ? h3Config.initial_image_url : ltxv2Config.image_url}
                         alt="Initial frame"
                         className="w-full max-h-48 object-contain rounded"
                         onError={(e) => {
@@ -496,6 +536,10 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                             setLtxv1Config(prev => ({ ...prev, initial_image_url: '' }))
                           } else if (selectedModel === 'ltx-2.3-local') {
                             setLtx23LocalConfig(prev => ({ ...prev, initial_image_url: '' }))
+                          } else if (selectedModel === 'ltx-2.3-condition') {
+                            setLtx23ConditionConfig(prev => ({ ...prev, initial_image_url: '' }))
+                          } else if (selectedModel === 'h3-max') {
+                            setH3Config(prev => ({ ...prev, initial_image_url: '' }))
                           } else {
                             setLtxv2Config(prev => ({ ...prev, image_url: '' }))
                           }
@@ -1079,6 +1123,51 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
           </div>
         )}
 
+        {/* H3 Max Parameters */}
+        {selectedModel === 'h3-max' && (
+          <div>
+            <label className="metric-label mb-3 block">H3 Max Parameters</label>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="metric-label mb-2 block text-xs">Clip Duration</label>
+                <select
+                  value={h3Config.h3_duration}
+                  onChange={(e) => setH3Config(prev => ({ ...prev, h3_duration: parseInt(e.target.value) }))}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 text-sm"
+                >
+                  {[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map(s => (
+                    <option key={s} value={s}>{s} seconds</option>
+                  ))}
+                </select>
+                <p className="text-xs mt-1 text-fal-gray-500">Longer clips = fewer API calls, slower chat steering</p>
+              </div>
+              <div>
+                <label className="metric-label mb-2 block text-xs">Render Resolution</label>
+                <select
+                  value={h3Config.h3_resolution}
+                  onChange={(e) => setH3Config(prev => ({ ...prev, h3_resolution: e.target.value as '480P' | '768P' }))}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 text-sm"
+                >
+                  <option value="480P">480P (fastest, comfortably realtime)</option>
+                  <option value="768P">768P (sharper, slower)</option>
+                </select>
+              </div>
+              <div>
+                <label className="metric-label mb-2 block text-xs">Prompt Expansion</label>
+                <select
+                  value={h3Config.h3_prompt_expansion_mode}
+                  onChange={(e) => setH3Config(prev => ({ ...prev, h3_prompt_expansion_mode: e.target.value as 'balanced' | 'disabled' }))}
+                  className="w-full bg-fal-gray-100 border border-fal-gray-300 rounded-lg p-3 text-fal-gray-900 text-sm"
+                >
+                  <option value="balanced">Balanced (fal rewrites for H3)</option>
+                  <option value="disabled">Disabled (director's prompt verbatim)</option>
+                </select>
+              </div>
+            </div>
+            <p className="text-xs mt-2 text-fal-gray-500">Streams at 24 fps (H3's native clip rate) with native audio. No GPU: generation runs behind the fal Model API.</p>
+          </div>
+        )}
+
         {/* Control Buttons */}
         <div className="flex items-center justify-between pt-4 border-t border-fal-gray-700">
           <div className="flex items-center space-x-4">
@@ -1091,6 +1180,8 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                     onStartTest({ ...ltx23ConditionConfig, initial_prompt: displayedPrompt })
                   } else if (selectedModel === 'ltx-2.3-local') {
                     onStartTest({ ...ltx23LocalConfig, initial_prompt: displayedPrompt })
+                  } else if (selectedModel === 'h3-max') {
+                    onStartTest({ ...h3Config, initial_prompt: displayedPrompt })
                   } else {
                     const processedConfig: any = {
                       ...ltxv2Config,

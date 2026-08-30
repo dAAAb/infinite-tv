@@ -6,7 +6,7 @@ from fal.toolkit.file import File
 class LTXVideoRequestI2V(BaseModel):
     prompt: str = Field(description="The prompt to generate the video")
     image_base64: str = Field(description="Base64 encoded input image")
-    model_type: Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition"] = Field(default="ltxv1", description="Which model to use for generation")
+    model_type: Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition", "h3-max"] = Field(default="ltxv1", description="Which model to use for generation")
     negative_prompt: str = Field(
         default="worst quality, inconsistent motion, blurry, jittery, distorted, static scene, frozen frame, no motion, repetitive, looping",
         description="The negative prompt",
@@ -41,6 +41,12 @@ class LTXVideoRequestI2V(BaseModel):
     duration: Optional[Literal[6, 8, 10, 12, 14, 16, 18, 20]] = Field(default=None, description="Duration in seconds (>10s requires 25fps and 1080p)")
     resolution: Optional[Literal["1080p", "1440p", "2160p"]] = Field(default=None, description="Resolution for LTX 2.3")
     aspect_ratio: Optional[Literal["auto", "16:9", "9:16"]] = Field(default=None, description="Aspect ratio for LTX 2.3")
+
+    # H3 Max (minimax/h3-max) API parameters. H3 renders 24 fps clips with
+    # native audio; run the stream at target_fps=24 so they play at speed.
+    h3_duration: Optional[int] = Field(default=15, ge=5, le=15, description="H3 Max clip duration in seconds (5-15)")
+    h3_resolution: Optional[Literal["480P", "768P"]] = Field(default="480P", description="H3 Max render resolution; 480P is comfortably faster than realtime")
+    h3_prompt_expansion_mode: Optional[Literal["balanced", "disabled"]] = Field(default="balanced", description="fal prompt expansion for H3 Max ('disabled' sends the director's prompt verbatim)")
 
 class LTXVideoResponseBase64(BaseModel):
     video_base64: str = Field(description="Base64 encoded video data")

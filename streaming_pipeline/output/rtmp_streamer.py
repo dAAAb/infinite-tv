@@ -130,6 +130,12 @@ class FFmpegRTMPStreamer(Monitorable):
             self.stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
             self.stream_thread.start()
 
+            # Drain ffmpeg's stderr: with pipe_stderr=True and no reader,
+            # ffmpeg blocks once the pipe fills, and the real reason for an
+            # exit (e.g. Twitch rejecting the stream key) is never logged.
+            self.stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+            self.stderr_thread.start()
+
             # Start the audio loop if native audio is enabled.
             if self.enable_audio:
                 self.audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
@@ -254,12 +260,24 @@ class FFmpegRTMPStreamer(Monitorable):
         silence_chunk = b"\x00" * int(AUDIO_BYTES_PER_SECOND * silence_chunk_seconds)
         self.audio_start_time = time.time()
 
+        # Every write MUST be a whole number of stereo s16 frames (4 bytes).
+        # A single misaligned write shifts every later sample across byte
+        # boundaries and the rest of the stream decodes as white noise.
+        bytes_per_pcm_frame = AUDIO_CHANNELS * 2
+
+        def write_all(data: bytes):
+            """os.write can be partial on pipes; write everything, count truth."""
+            view = memoryview(data)
+            while view:
+                written = os.write(self.audio_fifo_fd, view)
+                self.audio_bytes_written += written
+                view = view[written:]
+
         while self.is_streaming:
             try:
                 try:
                     pcm = self.audio_queue.get(timeout=0.05)
-                    os.write(self.audio_fifo_fd, pcm)
-                    self.audio_bytes_written += len(pcm)
+                    write_all(pcm)
                     continue
                 except Empty:
                     pass
@@ -269,11 +287,12 @@ class FFmpegRTMPStreamer(Monitorable):
                 # spamming gigabytes when generation is comfortably ahead.
                 wall_seconds = time.time() - self.audio_start_time
                 target_bytes = int(wall_seconds * AUDIO_BYTES_PER_SECOND)
-                if self.audio_bytes_written < target_bytes:
-                    deficit_bytes = target_bytes - self.audio_bytes_written
+                deficit_bytes = target_bytes - self.audio_bytes_written
+                # Round the deficit DOWN to whole stereo frames.
+                deficit_bytes -= deficit_bytes % bytes_per_pcm_frame
+                if deficit_bytes >= bytes_per_pcm_frame:
                     chunk = silence_chunk if deficit_bytes >= len(silence_chunk) else b"\x00" * deficit_bytes
-                    os.write(self.audio_fifo_fd, chunk)
-                    self.audio_bytes_written += len(chunk)
+                    write_all(chunk)
                 else:
                     # Comfortably ahead -- just sleep a bit.
                     time.sleep(0.01)
@@ -347,6 +366,22 @@ class FFmpegRTMPStreamer(Monitorable):
         queue_log.info(f"📊 Final queue size: {self.frame_queue.qsize()}/{self.frame_queue.maxsize}")
         
         return processed_count
+
+    def _stderr_loop(self):
+        """Log ffmpeg's stderr lines; RTMP failures otherwise vanish silently."""
+        proc = self.ffmpeg_process
+        if not proc or not proc.stderr:
+            return
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    queue_log.warning(f"🎥 ffmpeg: {line}")
+        except Exception:
+            pass
+        rc = proc.poll()
+        if rc is not None and rc != 0:
+            queue_log.error(f"❌ ffmpeg exited with code {rc} - see the ffmpeg lines above for the reason")
 
     def _stream_loop(self):
         """Send frames to FFmpeg at consistent FPS - REDUCED LOGGING"""

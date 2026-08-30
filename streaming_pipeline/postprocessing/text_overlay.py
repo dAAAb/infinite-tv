@@ -15,9 +15,12 @@ class TextOverlay(Monitorable):
     _FONT_CANDIDATES = (
         "/System/Library/Fonts/Arial.ttf",          # macOS
         "/System/Library/Fonts/Helvetica.ttc",      # macOS fallback
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",  # macOS (newer)
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Debian/Ubuntu (fal runners)
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",  # minimal Debian images
+        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
     )
 
     def __init__(self, width: int, height: int):
@@ -33,6 +36,7 @@ class TextOverlay(Monitorable):
 
         # Font cache keyed by pixel size so we don't reload TTF on every frame.
         self._font_cache: Dict[int, Any] = {}
+        self._font_logged = False
 
         # Pre-rendered overlay bitmap cache.  Rebuilt only when the text or
         # the target frame size changes, so per-frame work drops from ~9
@@ -77,13 +81,20 @@ class TextOverlay(Monitorable):
             try:
                 font = ImageFont.truetype(path, font_size)
                 self._font_cache[font_size] = font
+                if not self._font_logged:
+                    print(f"🔤 Overlay font: {path}")
+                    self._font_logged = True
                 return font
             except (OSError, IOError):
                 continue
-        # Last resort: PIL's bitmap default font (does not honor size, but draws).
+        # Last resort: PIL's bitmap default font (does not honor size, but draws
+        # tiny — if this fires on a runner, the overlay will look broken).
         try:
             font = ImageFont.load_default()
             self._font_cache[font_size] = font
+            if not self._font_logged:
+                print("🔤 Overlay font: PIL default bitmap (no TTF found — text will render tiny)")
+                self._font_logged = True
             return font
         except Exception:
             self._font_cache[font_size] = None

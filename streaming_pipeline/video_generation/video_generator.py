@@ -6,6 +6,10 @@ import os
 
 
 from streaming_pipeline.models import LTXVideoRequestI2V, LTXVideoResponseWithFrames, Monitorable
+# Must be a module-top import: fal ships local modules inside the serialized
+# module graph, so a function-local `from streaming_pipeline...` import fails
+# on the runner with "No module named 'streaming_pipeline'".
+from streaming_pipeline.video_generation.h3_generator import generate_h3_clip
 from typing import Dict, Any, List
 
 def safe_snapshot_download(
@@ -399,8 +403,26 @@ class RealtimeGenerator(Monitorable):
     
 
     
+    def generate_video_with_h3_api(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
+        """Generate video using the MiniMax H3 Max API (24 fps, native audio).
+
+        Pure API backend - no local weights, no GPU. See
+        video_generation/h3_generator.py for the ported implementation.
+        """
+        import time
+
+        start_time = time.time()
+        result = generate_h3_clip(request)
+
+        self.last_generation_time = time.time() - start_time
+        self.total_generation_time += self.last_generation_time
+        self.total_videos += 1
+        return result
+
     def generate_video_from_image(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Main entry point - routes to appropriate backend based on model_type"""
+        if request.model_type == "h3-max":
+            return self.generate_video_with_h3_api(request)
         if request.model_type == "ltx-2.3":
             return self.generate_video_with_fal_api(request)
         if request.model_type == "ltx-2.3-condition":
