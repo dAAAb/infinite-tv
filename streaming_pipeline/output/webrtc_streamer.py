@@ -238,7 +238,7 @@ class WebRTCStreamer(Monitorable):
             self.frames_dropped += 1
             logger.warning(f"WebRTCStreamer: failed to push frame: {e}")
 
-    def add_frame_batch(self, pil_frames: List[Image.Image]) -> int:
+    def add_frame_batch(self, pil_frames: List[Image.Image], playback_seconds: float | None = None) -> int:
         """Push multiple PIL frames. Returns count successfully enqueued."""
         if not self.is_streaming or self._video_track is None:
             return 0

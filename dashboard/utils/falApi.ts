@@ -7,6 +7,14 @@
  * Make an authenticated request to FAL API through proxy
  */
 export async function authenticatedFetch(targetUrl: string, options: RequestInit = {}) {
+  if (!targetUrl.includes('fal.run')) {
+    return fetch(targetUrl, {
+      method: options.method || 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: (options.method || 'POST') === 'GET' ? undefined : (options.body || JSON.stringify({})),
+    })
+  }
+
   return fetch('/api/fal/proxy', {
     method: 'POST',
     headers: {

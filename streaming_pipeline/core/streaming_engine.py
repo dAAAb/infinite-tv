@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import os
 from typing import Dict, Any
 from io import BytesIO
 from PIL import Image
@@ -460,10 +461,15 @@ class RealtimeVideoStreamer(Monitorable):
             # the NEXT clip is created by the outer _generation_loop AFTER
             # this returns and the state is updated, so it can use the just-
             # produced last frame as visual context.
-            video_result = await asyncio.to_thread(
-                self.realtime_generator.generate_video_from_image,
-                request
-            )
+            generation_start_time = time.time()
+            if os.getenv("RUN_GENERATION_INLINE", "true").lower() == "true":
+                video_result = self.realtime_generator.generate_video_from_image(request)
+            else:
+                video_result = await asyncio.to_thread(
+                    self.realtime_generator.generate_video_from_image,
+                    request
+                )
+            generation_duration = time.time() - generation_start_time
             
             # Stream frames to external streamer if available - USE BATCH PROCESSING
             # Check if still running before sending frames
@@ -478,7 +484,10 @@ class RealtimeVideoStreamer(Monitorable):
                 overlaid_frames = self.text_overlay.apply_overlay_batch(video_result.frames)
 
                 generation_log.info(f"📺 SENDING {len(overlaid_frames)} frames to RTMP streamer...")
-                processed_count = self.rtmp_streamer.add_frame_batch(overlaid_frames)
+                processed_count = self.rtmp_streamer.add_frame_batch(
+                    overlaid_frames,
+                    playback_seconds=generation_duration,
+                )
                 generation_log.info(f"📺 RTMP processed: {processed_count}/{len(overlaid_frames)} frames")
 
                 # Forward the matching audio chunk (no-op if audio disabled or

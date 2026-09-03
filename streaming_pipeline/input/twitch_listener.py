@@ -70,12 +70,19 @@ class TwitchChatListener(Monitorable):
         
         try:
             while self.is_listening:
+                sock.settimeout(300)  # 5 min timeout to detect dead connections
                 response = sock.recv(1024).decode('utf-8')
                 buffer += response
-                
+
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
-                    self._process_message(line.strip())
+                    stripped = line.strip()
+                    # Respond to PING to keep connection alive
+                    if stripped.startswith('PING'):
+                        pong_reply = stripped.replace('PING', 'PONG', 1)
+                        sock.send(f"{pong_reply}\n".encode('utf-8'))
+                        continue
+                    self._process_message(stripped)
                     
         finally:
             sock.close()
@@ -84,10 +91,6 @@ class TwitchChatListener(Monitorable):
         """Process incoming Twitch IRC message"""
         # Skip empty messages
         if not message.strip():
-            return
-            
-        # Handle PING to keep connection alive
-        if message.startswith('PING'):
             return
             
         # Only process chat messages

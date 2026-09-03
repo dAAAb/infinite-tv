@@ -213,6 +213,17 @@ class PromptGenerator(Monitorable):
             openai.OpenAI(api_key=openai_api_key) if openai_api_key else None
         )
 
+        local_url = os.getenv("LLM_BASE_URL")
+        self.local_client = (
+            openai.OpenAI(api_key=os.getenv("LLM_API_KEY", "local"), base_url=local_url)
+            if local_url
+            else None
+        )
+        self.local_text_model = os.getenv("LLM_TEXT_MODEL", "local")
+        self.local_vision_model = os.getenv("LLM_VISION_MODEL")
+        if self.local_client:
+            print(f"🏠 Local OpenAI-compatible LLM initialized: {local_url}")
+
         if groq_api_key and self.USE_GROQ:
             self.groq_client = openai.OpenAI(
                 api_key=groq_api_key,
@@ -235,9 +246,9 @@ class PromptGenerator(Monitorable):
         else:
             self.fal_openrouter_client = None
 
-        if not any([self.fal_openrouter_client, self.groq_client, self.openai_client]):
+        if not any([self.local_client, self.fal_openrouter_client, self.groq_client, self.openai_client]):
             raise ValueError(
-                "PromptGenerator requires at least one of FAL_KEY, "
+                "PromptGenerator requires at least one of LLM_BASE_URL, FAL_KEY, "
                 "GROQ_API_KEY, or OPENAI_API_KEY to be set."
             )
 
@@ -270,11 +281,18 @@ class PromptGenerator(Monitorable):
         """Select optimal model and client based on requirements.
 
         Preference order:
-          1. fal → OpenRouter (unified billing via FAL_KEY)
-          2. Groq (fastest inference, when GROQ_API_KEY is set)
-          3. OpenAI direct
+          1. Local OpenAI-compatible endpoint (when configured)
+          2. fal → OpenRouter (unified billing via FAL_KEY)
+          3. Groq (fastest inference, when GROQ_API_KEY is set)
+          4. OpenAI direct
         """
         needs_vision = self.VISUAL_MODE and context.current_frame_base64
+
+        if self.local_client and (not needs_vision or self.local_vision_model):
+            model = self.local_vision_model if needs_vision else self.local_text_model
+            label = "vision" if needs_vision else "text"
+            print(f"🏠 Using local {label} model: {model}")
+            return model, self.local_client
 
         if self.fal_openrouter_client:
             model = self.fal_vision_model if needs_vision else self.fal_text_model
@@ -299,6 +317,8 @@ class PromptGenerator(Monitorable):
         raise RuntimeError("No LLM client available for prompt generation")
 
     def _provider_label(self, client) -> str:
+        if client is self.local_client:
+            return "Local"
         if client is self.fal_openrouter_client:
             return "fal→OpenRouter"
         if client is self.groq_client:

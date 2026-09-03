@@ -1,6 +1,5 @@
 from typing import List, Optional, Literal
 from pydantic import BaseModel, Field
-from fal.toolkit.file import File
 
 
 class LTXVideoRequestI2V(BaseModel):
@@ -21,7 +20,8 @@ class LTXVideoRequestI2V(BaseModel):
     # stream's target_fps so audio playback duration aligns with video playback.
     frame_rate: float = Field(default=14.0, description="Generation frame rate; should match RTMP target_fps for in-sync audio")
     strength: float = Field(default=1.0, description="How much to follow the input image")
-    guidance_scale: float = Field(default=3.0, description="Classifier-free guidance scale (1=off, 3-4 typical for distilled)")
+    guidance_scale: float = Field(default=1.0, description="Classifier-free guidance scale (1=off, 3-4 typical for distilled)")
+    num_inference_steps: int = Field(default=5, description="Number of denoising steps for local LTX 2.3 generation")
     timesteps: List[float] = Field(default=[1000, 993, 987, 981, 975, 909, 725, 0.03], description="The timesteps to use")
 
     # LTX 2.3-local fixation-control parameters

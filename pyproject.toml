@@ -9,25 +9,32 @@ description = "Real-time video generation and streaming pipeline"
 dependencies = [
     # Core ML dependencies
     "torch>=2.1.0",
-    "diffusers>=0.28.2", 
-    "transformers>=4.47.2,<4.52.0",
+    "numpy==2.1.3",
+    "safetensors==0.5.3",
+    "diffusers==0.39.0", 
+    "transformers==4.57.3",
     "accelerate>=1.4.0",
+    "sentencepiece>=0.1.96",
+    "huggingface-hub~=0.30",
+    "hf_transfer",
+    "einops",
+    "timm",
     
     # Video processing
     "imageio[ffmpeg]>=2.25.0",
     "opencv-python>=4.9.0.80",
     "av",
     "ffmpeg-python",
+    "torchaudio",
+    "aiortc==1.14.0",
     
     # API and integrations
     "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
     "pydantic>=1.8,<2.0",
     "requests>=2.28.0",
-    
-    # fal
-    "fal",
 ]
 
 

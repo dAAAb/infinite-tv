@@ -77,20 +77,20 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
     height: 384,
     width: 512,
     num_frames: 121,
-    target_fps: 20.0,
+    target_fps: 9.0,
     mode: 'regular',
     // Fixation-control defaults (mirror backend api.py defaults).
     // STG defaults to OFF because it requires spatio_temporal_guidance_blocks
     // which depend on the model architecture; enable from Advanced if you
     // know the right block indices for your checkpoint.
-    guidance_scale: 3.0,
+    guidance_scale: 1.0,
     stg_scale: 0.0,
     spatio_temporal_guidance_blocks: null,
     noise_scale: 0.15,
     seed: null,
     llm_temperature: 0.55,
     enable_audio: true,
-    output_mode: 'rtmp',
+    output_mode: 'webrtc',
     style_preset: 'cohesive',
   })
 
@@ -1019,7 +1019,7 @@ export default function TestControlPanel({ onStartTest, onStopTest, onUpdateConf
                   type="button"
                   onClick={() => {
                     const PRESET_PARAMS: Record<string, Partial<LTX23LocalConfig>> = {
-                      cohesive:  { guidance_scale: 2.0, noise_scale: 0.03, llm_temperature: 0.55, mode: 'regular' },
+                      cohesive:  { guidance_scale: 1.0, noise_scale: 0.03, llm_temperature: 0.55, mode: 'regular' },
                       chaotic:   { guidance_scale: 3.0, noise_scale: 0.15, llm_temperature: 0.7, mode: 'regular' },
                       nightmare: { guidance_scale: 3.5, noise_scale: 0.20, llm_temperature: 0.9, mode: 'nightmare' },
                     }

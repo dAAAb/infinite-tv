@@ -122,9 +122,9 @@ export interface LTXv1Config {
   mode: 'regular' | 'nightmare'
 }
 
-// LTX 2.3 Local configuration types
-export interface LTX23LocalConfig {
-  model: 'ltx-2.3-local'
+// LTX 2.3 shared local/condition configuration types
+export interface LTX23BaseConfig {
+  model: 'ltx-2.3-local' | 'ltx-2.3-condition'
   initial_prompt: string
   initial_image_url: string
   negative_prompt: string
@@ -152,13 +152,17 @@ export interface LTX23LocalConfig {
   style_preset: 'cohesive' | 'chaotic' | 'nightmare' | 'custom'
 }
 
+export interface LTX23LocalConfig extends LTX23BaseConfig {
+  model: 'ltx-2.3-local'
+}
+
 export interface CharacterRef {
   image: string       // base64 data URI or HTTPS URL
   strength: number    // 0-1, default 0.4
   label: string       // display name, e.g. "Homer Simpson"
 }
 
-export interface LTX23ConditionConfig extends LTX23LocalConfig {
+export interface LTX23ConditionConfig extends LTX23BaseConfig {
   model: 'ltx-2.3-condition'
   character_refs: CharacterRef[]
 }

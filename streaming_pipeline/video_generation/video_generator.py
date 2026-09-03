@@ -3,6 +3,7 @@ from PIL import Image
 from io import BytesIO
 import base64
 import os
+import sys
 
 
 from streaming_pipeline.models import LTXVideoRequestI2V, LTXVideoResponseWithFrames, Monitorable
@@ -19,22 +20,23 @@ def safe_snapshot_download(
     # https://docs.fal.ai/serverless/code/your-code-data-weights
     kwargs.setdefault("max_workers", 32)
 
-    try:
-        print("Loading local repo...")
-        repo_path = snapshot_download(
+    local_only = os.getenv("HF_LOCAL_ONLY", "false").lower() == "true"
+    if local_only:
+        print("Loading local repo only...")
+        return snapshot_download(
             repo_id=repo_id,
             revision=revision,
             local_files_only=True,
             **kwargs,
         )
-    except:
-        print("Failed to load local repo, downloading from Hugging Face Hub...")
-        repo_path = snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            local_files_only=False,
-            **kwargs,
-        )
+
+    print("Downloading or completing local repo from Hugging Face Hub...")
+    repo_path = snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        local_files_only=False,
+        **kwargs,
+    )
     return repo_path
 
 
@@ -90,22 +92,46 @@ def preload_files(directory: str, parallelism: int = 32) -> None:
     reads from RAM instead of the network.
     See: https://docs.fal.ai/documentation/serverless/optimizations/parallel-file-loading
     """
+    if os.getenv("PRELOAD_MODEL_FILES", "false").lower() != "true":
+        return
+
     import subprocess
     print(f"📦 Pre-reading {directory} with parallelism={parallelism}...")
-    subprocess.check_call(
-        f"find '{directory}' -type f | xargs -P {parallelism} -I {{}} cat {{}} > /dev/null",
-        shell=True,
-    )
+    if sys.platform.startswith("win"):
+        from concurrent.futures import ThreadPoolExecutor
+
+        files = []
+        for root, _, filenames in os.walk(directory):
+            files.extend(os.path.join(root, name) for name in filenames)
+
+        def _read(path: str) -> None:
+            with open(path, "rb") as handle:
+                while handle.read(1024 * 1024):
+                    pass
+
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            list(pool.map(_read, files))
+    else:
+        subprocess.check_call(
+            f"find '{directory}' -type f | xargs -P {parallelism} -I {{}} cat {{}} > /dev/null",
+            shell=True,
+        )
     print("📦 Pre-read complete.")
 
 
 MODEL_ID = "Lightricks/LTX-Video-0.9.8-13B-distilled"
 REVISION = "main"
-WEIGHTS_DIR = "/data/models/ltx-video-0.9.8-13b"
+WEIGHTS_DIR = os.getenv(
+    "LTX_WEIGHTS_DIR",
+    os.path.join(os.getcwd(), "models", "ltx-video-0.9.8-13b"),
+)
 
 LTX23_MODEL_ID = "dg845/LTX-2.3-Distilled-Diffusers"
 LTX23_REVISION = "main"
-LTX23_WEIGHTS_DIR = "/data/models/ltx-2.3-distilled-v2"
+LTX23_WEIGHTS_DIR = os.getenv(
+    "LTX23_WEIGHTS_DIR",
+    os.path.join(os.getcwd(), "models", "ltx-2.3-distilled-v2"),
+)
 
 
 # Regular Python class for local use (non-fal.App)
@@ -191,10 +217,26 @@ class RealtimeGenerator(Monitorable):
             storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16
         )
 
+        # torch.compile for faster inference — requires Triton backend.
+        # Uses "reduce-overhead" mode for triton-windows compatibility
+        # (max-autotune hits CompiledKernel.launch_enter_hook mismatch).
+        if os.getenv("LTX23_TORCH_COMPILE", "false").lower() == "true":
+            try:
+                import triton  # noqa: F401
+                print("⚡ Compiling transformer with torch.compile (reduce-overhead)...")
+                transformer = torch.compile(transformer, mode="reduce-overhead")
+                print("⚡ torch.compile applied!")
+            except ImportError:
+                print("⚠️ torch.compile skipped: triton not available")
+
         self.pipeline_v23 = LTX2ImageToVideoPipeline.from_pretrained(
             checkpoint_dir, transformer=transformer, torch_dtype=torch.bfloat16
         )
-        self.pipeline_v23.to("cuda")
+        if os.getenv("LTX23_CPU_OFFLOAD", "true").lower() == "true":
+            self.pipeline_v23.enable_model_cpu_offload()
+            print("🧠 LTX 2.3 CPU offload enabled")
+        else:
+            self.pipeline_v23.to("cuda")
         # VAE tiling is intentionally NOT enabled here: it chunks the spatial
         # decode to fit small-VRAM GPUs at the cost of per-tile overhead.
         # On GPU-B200 (192 GB HBM3e) we have plenty of headroom, so the
@@ -214,7 +256,8 @@ class RealtimeGenerator(Monitorable):
         # Also load the condition pipeline (shares the same transformer + VAE,
         # no extra VRAM).  This enables multi-image conditioning for character
         # reference anchoring.
-        self._setup_ltx23_condition()
+        if os.getenv("LOAD_LTX23_CONDITION", "false").lower() == "true":
+            self._setup_ltx23_condition()
 
     def _setup_ltx23_condition(self):
         """Load LTX2ConditionPipeline sharing the transformer from pipeline_v23."""
@@ -469,14 +512,19 @@ class RealtimeGenerator(Monitorable):
             height=request.height,
             num_frames=request.num_frames,
             frame_rate=float(request.frame_rate),
-            num_inference_steps=8,
-            sigmas=DISTILLED_SIGMA_VALUES,
+            num_inference_steps=request.num_inference_steps,
             guidance_scale=request.guidance_scale,
             modality_scale=1.0,
             generator=torch.Generator(device="cuda").manual_seed(seed),
             output_type="pil",
             return_dict=False,
         )
+        if request.num_inference_steps == len(DISTILLED_SIGMA_VALUES):
+            pipeline_kwargs["sigmas"] = DISTILLED_SIGMA_VALUES
+        elif request.num_inference_steps < len(DISTILLED_SIGMA_VALUES):
+            indices = [int(i * (len(DISTILLED_SIGMA_VALUES) - 1) / (request.num_inference_steps - 1))
+                       for i in range(request.num_inference_steps)]
+            pipeline_kwargs["sigmas"] = [DISTILLED_SIGMA_VALUES[i] for i in indices]
 
         try:
             video, audio = self.pipeline_condition(**pipeline_kwargs)
@@ -547,8 +595,7 @@ class RealtimeGenerator(Monitorable):
             # determines the generated audio length; passing the RTMP stream's
             # target_fps keeps audio length aligned with video playback.
             frame_rate=float(request.frame_rate),
-            num_inference_steps=8,
-            sigmas=DISTILLED_SIGMA_VALUES,
+            num_inference_steps=request.num_inference_steps,
             guidance_scale=request.guidance_scale,
             noise_scale=request.noise_scale,
             modality_scale=1.0,
@@ -556,6 +603,15 @@ class RealtimeGenerator(Monitorable):
             output_type="pil",
             return_dict=False,
         )
+        # Use distilled sigma schedule: full 8-step or evenly subsampled
+        if request.num_inference_steps == len(DISTILLED_SIGMA_VALUES):
+            pipeline_kwargs["sigmas"] = DISTILLED_SIGMA_VALUES
+        elif request.num_inference_steps < len(DISTILLED_SIGMA_VALUES):
+            # Subsample the distilled sigmas evenly for fewer steps
+            indices = [int(i * (len(DISTILLED_SIGMA_VALUES) - 1) / (request.num_inference_steps - 1))
+                       for i in range(request.num_inference_steps)]
+            pipeline_kwargs["sigmas"] = [DISTILLED_SIGMA_VALUES[i] for i in indices]
+            print(f"⚡ Using {request.num_inference_steps}-step subsampled sigmas: {pipeline_kwargs['sigmas']}")
 
         stg_blocks = getattr(request, "spatio_temporal_guidance_blocks", None)
         if request.stg_scale and request.stg_scale > 0 and stg_blocks:

@@ -48,7 +48,7 @@ export function useRealtimeWebSocket(apiUrl: string = process.env.NEXT_PUBLIC_FA
       return
     }
 
-    if (!token) {
+    if (apiUrl.includes('fal.run') && !token) {
       console.log('📡 No token available yet, waiting...')
       return
     }
@@ -57,8 +57,9 @@ export function useRealtimeWebSocket(apiUrl: string = process.env.NEXT_PUBLIC_FA
       // Convert HTTP URL to WebSocket URL
       let wsUrl = apiUrl.replace(/^http:\/\//, 'ws://').replace(/^https:\/\//, 'wss://') + '/metrics/ws'
       
-      // Add fal_jwt_token as query parameter
-      wsUrl += `?fal_jwt_token=${encodeURIComponent(token)}`
+      if (apiUrl.includes('fal.run') && token) {
+        wsUrl += `?fal_jwt_token=${encodeURIComponent(token)}`
+      }
       
       console.log('📡 Connecting to WebSocket with JWT token')
       
@@ -170,6 +171,11 @@ export function useRealtimeWebSocket(apiUrl: string = process.env.NEXT_PUBLIC_FA
 
   // Fetch and refresh token
   useEffect(() => {
+    if (!apiUrl.includes('fal.run')) {
+      setToken('local')
+      return
+    }
+
     if (token) {
       return // Token already exists
     }
@@ -210,8 +216,8 @@ export function useRealtimeWebSocket(apiUrl: string = process.env.NEXT_PUBLIC_FA
   }, [token, apiUrl])
 
   useEffect(() => {
-    // Only connect once we have a token
-    if (token) {
+    // Only connect once we have a token for fal, or immediately for local.
+    if (token || !apiUrl.includes('fal.run')) {
       connect()
     }
     

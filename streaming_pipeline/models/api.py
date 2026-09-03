@@ -37,12 +37,12 @@ class StartStreamRequest(BaseModel):
     )
     height: Optional[int] = Field(default=384, description="The height of the video (must be divisible by 32)")
     width: Optional[int] = Field(default=512, description="The width of the video (must be divisible by 32)")
-    num_frames: Optional[int] = Field(default=121, description="The number of frames to generate (must be 8*k + 1)")
+    num_frames: Optional[int] = Field(default=9, description="The number of frames to generate (must be 8*k + 1)")
     # If unset, streaming_service auto-fills this from target_fps so audio
     # length matches the RTMP stream's playback duration.
     frame_rate: Optional[float] = Field(default=None, description="Generation frame rate (defaults to target_fps to keep audio in sync with playback)")
     strength: Optional[float] = Field(default=1.0, description="How much to follow the input image")
-    guidance_scale: Optional[float] = Field(default=3.0, description="Classifier-free guidance scale (1=off, 3-4 typical for distilled)")
+    guidance_scale: Optional[float] = Field(default=1.0, description="Classifier-free guidance scale (1=off, 3-4 typical for distilled)")
     timesteps: Optional[List[float]] = Field(default=[1000, 981, 909, 725, 0.03], description="The timesteps to use")
 
     # LTX 2.3-local fixation-control parameters
@@ -61,7 +61,7 @@ class StartStreamRequest(BaseModel):
     mode: Optional[str] = Field(default="regular", description="Generation mode: 'regular' or 'nightmare'")
     enable_audio: Optional[bool] = Field(default=True, description="Stream LTX 2.3's natively-generated audio instead of silent anullsrc (ltx-2.3-local only)")
     output_mode: Optional[Literal["rtmp", "webrtc"]] = Field(
-        default="rtmp",
+        default="webrtc",
         description="Output backend: 'rtmp' pushes to Twitch via FFmpeg, 'webrtc' streams directly to browser via aiortc",
     )
     llm_temperature: Optional[float] = Field(default=0.7, description="LLM temperature for prompt generation (lower = more predictable, higher = more creative)")

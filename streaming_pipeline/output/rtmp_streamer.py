@@ -1,5 +1,6 @@
 import ffmpeg
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -10,6 +11,14 @@ import cv2
 from streaming_pipeline.utils.logger_config import queue_log
 from streaming_pipeline.models import Monitorable
 
+# Windows named-pipe helpers (used when enable_audio=True on Windows).
+_IS_WINDOWS = sys.platform == "win32"
+if _IS_WINDOWS:
+    import ctypes
+    import ctypes.wintypes
+    import msvcrt
+    _kernel32 = ctypes.windll.kernel32
+
 
 # Audio output is fixed at stereo s16le @ 44.1 kHz (Twitch ingest spec).
 AUDIO_SAMPLE_RATE = 44100
@@ -19,12 +28,13 @@ AUDIO_BYTES_PER_SECOND = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SA
 
 
 class FFmpegRTMPStreamer(Monitorable):
-    def __init__(self, stream_key: str, fps: int = 24, width: int = 640, height: int = 480, enable_audio: bool = False):
+    def __init__(self, stream_key: str, fps: int = 24, width: int = 640, height: int = 480, enable_audio: bool = False, bgm_path: str | None = None):
         self.stream_key = stream_key
         self.fps = fps
         self.width = width
         self.height = height
         self.enable_audio = enable_audio
+        self.bgm_path = bgm_path  # Optional background music file (loops forever)
         # Fix: Use correct Twitch RTMP path
         self.rtmp_url = f"rtmp://live.twitch.tv/app/{stream_key}"
 
@@ -34,14 +44,16 @@ class FFmpegRTMPStreamer(Monitorable):
         self.stream_thread = None
         self.monitor_thread = None
 
-        # Frame management - Optimized buffer size
-        self.frame_queue = Queue(maxsize=1000)  # ~9 seconds at 16fps
+        # Frame management. Keep enough room to spread a generated clip across
+        # several minutes of real-time playback without dropping early frames.
+        self.frame_queue = Queue(maxsize=max(1000, int(self.fps * 600)))
 
         # Audio plumbing (only used when enable_audio=True)
         self.audio_queue: "Queue[bytes]" = Queue(maxsize=64)  # ~64 clips of audio
         self.audio_thread: threading.Thread | None = None
         self.audio_fifo_path: str | None = None
         self.audio_fifo_fd: int | None = None
+        self._win_pipe_handle = None  # Windows named pipe HANDLE
         # Bytes streamed; used to throttle silence injection so we don't
         # outpace ffmpeg's audio decoder when the queue is empty.
         self.audio_bytes_written = 0
@@ -54,6 +66,7 @@ class FFmpegRTMPStreamer(Monitorable):
         self.frames_added_last_second = 0
         self.frames_dropped_last_second = 0
         self.start_time = None
+        self.placeholder_frame = None
 
     def start_stream(self):
         """Start FFmpeg RTMP stream to Twitch"""
@@ -67,6 +80,7 @@ class FFmpegRTMPStreamer(Monitorable):
             print(f"   FPS: {self.fps}")
             print(f"   Audio: {'native (LTX 2.3 vocoder)' if self.enable_audio else 'silent (anullsrc)'}")
             print(f"   RTMP URL: {self.rtmp_url[:50]}...")
+            self.placeholder_frame = self._load_placeholder_frame()
 
             video_in = ffmpeg.input(
                 'pipe:',
@@ -76,16 +90,40 @@ class FFmpegRTMPStreamer(Monitorable):
                 framerate=self.fps,  # Use 'framerate' instead of 'r' for raw pipe
             )
 
-            # Build the audio input: native PCM via FIFO if enabled, else silent.
+            # Build the audio input: native PCM via pipe if enabled, else silent.
             if self.enable_audio:
-                # Create a FIFO that ffmpeg will read PCM from.  We open it for
-                # writing in a background thread *after* spawning ffmpeg, so
-                # that ffmpeg has opened it for reading first (otherwise the
-                # writer-side open() will block forever).
-                fifo_dir = tempfile.mkdtemp(prefix="ltx_audio_")
-                self.audio_fifo_path = os.path.join(fifo_dir, "audio.pcm")
-                os.mkfifo(self.audio_fifo_path)
-                queue_log.info(f"🔊 Created audio FIFO at {self.audio_fifo_path}")
+                # Create a platform-appropriate named pipe so ffmpeg can read
+                # raw PCM while we write from _audio_loop.
+                if _IS_WINDOWS:
+                    pipe_name = rf"\\.\pipe\ltx_audio_{os.getpid()}"
+                    PIPE_ACCESS_OUTBOUND = 0x00000002
+                    PIPE_TYPE_BYTE = 0x00000000
+                    PIPE_WAIT = 0x00000000
+                    INVALID_HANDLE = ctypes.wintypes.HANDLE(-1).value
+                    buf_sz = 1 << 16  # 64 KiB
+
+                    handle = _kernel32.CreateNamedPipeW(
+                        pipe_name,
+                        PIPE_ACCESS_OUTBOUND,
+                        PIPE_TYPE_BYTE | PIPE_WAIT,
+                        1,       # max instances
+                        buf_sz,  # out buffer
+                        buf_sz,  # in buffer
+                        0,       # default timeout
+                        None,    # security attrs
+                    )
+                    if handle == INVALID_HANDLE:
+                        raise OSError(f"CreateNamedPipeW failed (err={ctypes.GetLastError()})")
+                    self._win_pipe_handle = handle
+                    self.audio_fifo_path = pipe_name
+                    queue_log.info(f"🔊 Created Windows named pipe at {pipe_name}")
+                else:
+                    # Unix: classic FIFO
+                    fifo_dir = tempfile.mkdtemp(prefix="ltx_audio_")
+                    self.audio_fifo_path = os.path.join(fifo_dir, "audio.pcm")
+                    os.mkfifo(self.audio_fifo_path)
+                    queue_log.info(f"🔊 Created Unix FIFO at {self.audio_fifo_path}")
+
                 audio_in = ffmpeg.input(
                     self.audio_fifo_path,
                     format='s16le',
@@ -97,6 +135,16 @@ class FFmpegRTMPStreamer(Monitorable):
                     'anullsrc=channel_layout=stereo:sample_rate=44100',
                     f='lavfi',
                 )
+
+            # Mix in background music if a BGM file is provided.
+            if self.bgm_path and os.path.isfile(self.bgm_path):
+                bgm_in = ffmpeg.input(self.bgm_path, stream_loop=-1)
+                # Lower BGM volume so it doesn't overpower LTX audio / sit comfortably
+                bgm_quiet = bgm_in.filter('volume', 0.3)
+                audio_in = ffmpeg.filter([audio_in, bgm_quiet], 'amix',
+                                         inputs=2, duration='longest',
+                                         dropout_transition=0)
+                queue_log.info(f"🎵 BGM mixed in: {self.bgm_path} (volume=0.3, loop)")
 
             self.ffmpeg_process = (
                 ffmpeg
@@ -170,14 +218,20 @@ class FFmpegRTMPStreamer(Monitorable):
         print("✅ FFmpeg RTMP stream stopped")
 
     def _cleanup_audio_fifo(self):
-        """Close the audio FIFO writer fd and remove the temp file."""
+        """Close the audio pipe/FIFO and clean up resources."""
         if self.audio_fifo_fd is not None:
             try:
                 os.close(self.audio_fifo_fd)
             except OSError:
                 pass
             self.audio_fifo_fd = None
-        if self.audio_fifo_path:
+        if _IS_WINDOWS and self._win_pipe_handle is not None:
+            try:
+                _kernel32.CloseHandle(self._win_pipe_handle)
+            except Exception:
+                pass
+            self._win_pipe_handle = None
+        elif self.audio_fifo_path and not _IS_WINDOWS:
             try:
                 os.unlink(self.audio_fifo_path)
             except OSError:
@@ -186,7 +240,7 @@ class FFmpegRTMPStreamer(Monitorable):
                 os.rmdir(os.path.dirname(self.audio_fifo_path))
             except OSError:
                 pass
-            self.audio_fifo_path = None
+        self.audio_fifo_path = None
 
     def _reset_metrics(self):
         """Reset all metrics and clear queue when stream stops"""
@@ -240,12 +294,22 @@ class FFmpegRTMPStreamer(Monitorable):
         slightly than to underrun and stall the whole pipeline.
         """
         try:
-            # Blocking open: returns once ffmpeg has opened the FIFO for reading.
-            queue_log.info(f"🔊 Opening audio FIFO for writing: {self.audio_fifo_path}")
-            self.audio_fifo_fd = os.open(self.audio_fifo_path, os.O_WRONLY)
-            queue_log.info(f"🔊 Audio FIFO writer connected; streaming PCM at {AUDIO_SAMPLE_RATE} Hz stereo")
+            if _IS_WINDOWS and self._win_pipe_handle is not None:
+                # Wait for ffmpeg to connect to the named pipe (blocking).
+                queue_log.info(f"🔊 Waiting for FFmpeg to connect to named pipe: {self.audio_fifo_path}")
+                connected = _kernel32.ConnectNamedPipe(self._win_pipe_handle, None)
+                if not connected and ctypes.GetLastError() != 535:  # ERROR_PIPE_CONNECTED
+                    raise OSError(f"ConnectNamedPipe failed (err={ctypes.GetLastError()})")
+                # Convert Windows HANDLE → C runtime fd → Python can os.write()
+                self.audio_fifo_fd = msvcrt.open_osfhandle(self._win_pipe_handle, 0)
+                queue_log.info(f"🔊 Windows named pipe connected; streaming PCM at {AUDIO_SAMPLE_RATE} Hz stereo")
+            else:
+                # Unix: blocking open returns once ffmpeg has opened the FIFO for reading.
+                queue_log.info(f"🔊 Opening audio FIFO for writing: {self.audio_fifo_path}")
+                self.audio_fifo_fd = os.open(self.audio_fifo_path, os.O_WRONLY)
+                queue_log.info(f"🔊 Audio FIFO writer connected; streaming PCM at {AUDIO_SAMPLE_RATE} Hz stereo")
         except Exception as e:
-            queue_log.error(f"❌ Could not open audio FIFO writer: {e}")
+            queue_log.error(f"❌ Could not open audio pipe: {e}")
             return
 
         # Pace silence padding so we don't write faster than wall-clock.
@@ -289,6 +353,19 @@ class FFmpegRTMPStreamer(Monitorable):
 
     
 
+    def _enqueue_frame_array(self, frame_array):
+        """Put a prepared RGB frame into the stream queue."""
+        try:
+            self.frame_queue.put_nowait(frame_array)
+        except:
+            # Queue full - drop oldest frame and add new one
+            try:
+                self.frame_queue.get_nowait()
+                self.frames_dropped += 1
+                self.frame_queue.put_nowait(frame_array)
+            except Empty:
+                pass
+
     def add_frame(self, pil_frame):
         """Add PIL Image frame to stream queue"""
         if not self.is_streaming:
@@ -300,23 +377,20 @@ class FFmpegRTMPStreamer(Monitorable):
             if frame_array.shape[:2] != (self.height, self.width):
                 frame_array = cv2.resize(frame_array, (self.width, self.height))
             
-            # Add to queue with non-blocking put
-            try:
-                self.frame_queue.put_nowait(frame_array)
-            except:
-                # Queue full - drop oldest frame and add new one
-                try:
-                    self.frame_queue.get_nowait()
-                    self.frames_dropped += 1
-                    self.frame_queue.put_nowait(frame_array)
-                except Empty:
-                    pass
+            self._enqueue_frame_array(frame_array)
             
         except Exception as e:
             print(f"❌ Error processing frame: {e}")
 
-    def add_frame_batch(self, pil_frames):
-        """Add multiple frames efficiently using batch processing"""
+    def add_frame_batch(self, pil_frames, playback_seconds: float | None = None):
+        """Add multiple frames efficiently using batch processing.
+
+        If playback_seconds is provided and longer than the clip's native
+        duration, spread the generated frames across that wall-clock window.
+        This avoids the Twitch-visible pattern where a newly generated clip
+        plays quickly, then the stream repeats the last frame while waiting for
+        the next generation.
+        """
         if not self.is_streaming:
             queue_log.warning(f"❌ RTMP not streaming - rejecting {len(pil_frames) if pil_frames else 0} frames")
             return 0
@@ -325,17 +399,41 @@ class FFmpegRTMPStreamer(Monitorable):
             queue_log.warning("❌ No frames provided to add_frame_batch")
             return 0
         
+        clip_seconds = len(pil_frames) / max(1, float(self.fps))
+        target_seconds = max(clip_seconds, float(playback_seconds or 0))
+        repeat_per_frame = max(1, int(round((target_seconds * float(self.fps)) / len(pil_frames))))
+        max_hold_seconds = float(os.getenv("RTMP_MAX_GENERATED_FRAME_HOLD_SECONDS", "6"))
+        max_repeat_per_frame = max(1, int(round(max_hold_seconds * float(self.fps))))
+        if repeat_per_frame > max_repeat_per_frame:
+            queue_log.info(
+                f"📺 DRIP CAP: limiting generated frame hold from "
+                f"{repeat_per_frame / float(self.fps):.1f}s to {max_hold_seconds:.1f}s"
+            )
+            repeat_per_frame = max_repeat_per_frame
+        expanded_count = len(pil_frames) * repeat_per_frame
+
         queue_log.info(f"📺 BATCH START: Processing {len(pil_frames)} frames...")
+        if repeat_per_frame > 1:
+            queue_log.info(
+                f"📺 DRIP PLAYBACK: spreading over ~{expanded_count / float(self.fps):.1f}s "
+                f"({repeat_per_frame} stream frames per generated frame)"
+            )
         queue_log.info(f"📊 Current queue size: {self.frame_queue.qsize()}/{self.frame_queue.maxsize}")
         
         batch_start_time = time.time()
         processed_count = 0
         
-        # Simply loop through frames and reuse existing add_frame logic
+        # Convert each generated frame once, then enqueue repeats for paced
+        # playback at the RTMP stream's fixed FPS.
         for pil_frame in pil_frames:
             try:
-                self.add_frame(pil_frame)  # Reuse existing optimized logic
-                processed_count += 1
+                frame_array = np.array(pil_frame.convert('RGB'))
+                if frame_array.shape[:2] != (self.height, self.width):
+                    frame_array = cv2.resize(frame_array, (self.width, self.height))
+
+                for _ in range(repeat_per_frame):
+                    self._enqueue_frame_array(frame_array)
+                    processed_count += 1
             except Exception as e:
                 print(f"❌ Error processing frame in batch: {e}")
                 continue
@@ -343,7 +441,7 @@ class FFmpegRTMPStreamer(Monitorable):
         batch_duration = time.time() - batch_start_time
         batch_fps = processed_count / batch_duration if batch_duration > 0 else 0
         
-        queue_log.info(f"📺 BATCH COMPLETE: {processed_count}/{len(pil_frames)} frames in {batch_duration:.2f}s ({batch_fps:.1f} fps)")
+        queue_log.info(f"📺 BATCH COMPLETE: {processed_count} stream frames from {len(pil_frames)} generated frames in {batch_duration:.2f}s ({batch_fps:.1f} fps)")
         queue_log.info(f"📊 Final queue size: {self.frame_queue.qsize()}/{self.frame_queue.maxsize}")
         
         return processed_count
@@ -439,13 +537,37 @@ class FFmpegRTMPStreamer(Monitorable):
         
         print("📺 Frame streaming loop ended")
 
+    def _load_placeholder_frame(self):
+        """Load a visible fallback frame so an empty queue never turns Twitch black."""
+        candidates = [
+            os.getenv("RTMP_PLACEHOLDER_IMAGE"),
+            os.path.join(os.getcwd(), "outputs", "twitch-rubberhose", "twitch-rubberhose-01.png"),
+            os.path.join(os.getcwd(), "outputs", "twitch-rubberhose", "twitch-rubberhose-01-day.png"),
+        ]
+        for path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                image = Image.open(path).convert("RGB")
+                frame_array = np.array(image)
+                if frame_array.shape[:2] != (self.height, self.width):
+                    frame_array = cv2.resize(frame_array, (self.width, self.height))
+                queue_log.info(f"🖼️ Loaded RTMP placeholder image: {path}")
+                return frame_array
+            except Exception as e:
+                queue_log.warning(f"⚠️ Could not load RTMP placeholder image {path}: {e}")
+        return None
+
     def _create_placeholder_frame(self, frame_count):
-        """Create a black placeholder frame when no content is available"""
-        frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        """Create a visible placeholder frame when no content is available."""
+        if self.placeholder_frame is not None:
+            return self._create_varied_frame(self.placeholder_frame, frame_count)
+
+        frame = np.full((self.height, self.width, 3), 24, dtype=np.uint8)
         
         # Optional: Add subtle visual indicator
         if frame_count % (self.fps * 4) < (self.fps * 2):  # Blink every 4 seconds
-            frame[10:20, 10:20] = [30, 30, 30]  # Small dark gray square
+            frame[10:20, 10:20] = [80, 80, 80]  # Small gray square
         
         return frame
 

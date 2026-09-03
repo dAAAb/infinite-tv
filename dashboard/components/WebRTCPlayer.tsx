@@ -55,12 +55,14 @@ export default function WebRTCPlayer({ apiUrl }: WebRTCPlayerProps) {
         ? apiUrl.split('/').pop() || 'realtime-streaming'
         : 'realtime-streaming'
 
-      const token = await fetchTemporaryToken(appName)
+      const token = apiUrl.includes('fal.run')
+        ? await fetchTemporaryToken(appName)
+        : null
 
       const wsUrl = apiUrl
         .replace(/^http:\/\//, 'ws://')
         .replace(/^https:\/\//, 'wss://')
-        + `/webrtc?fal_jwt_token=${encodeURIComponent(token)}`
+        + (token ? `/webrtc?fal_jwt_token=${encodeURIComponent(token)}` : '/webrtc')
 
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws

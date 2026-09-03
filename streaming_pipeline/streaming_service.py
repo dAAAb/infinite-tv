@@ -44,10 +44,11 @@ class StreamingService:
         groq_key = os.getenv("GROQ_API_KEY")
         fal_key = os.getenv("FAL_KEY")
         stream_key = os.getenv("TWITCH_STREAM_KEY")
+        local_llm_url = os.getenv("LLM_BASE_URL")
 
-        if not (fal_key or openai_key or groq_key):
+        if not (local_llm_url or fal_key or openai_key or groq_key):
             raise ValueError(
-                "At least one of FAL_KEY, OPENAI_API_KEY, or GROQ_API_KEY "
+                "At least one of LLM_BASE_URL, FAL_KEY, OPENAI_API_KEY, or GROQ_API_KEY "
                 "must be set for prompt generation."
             )
 
@@ -61,18 +62,20 @@ class StreamingService:
 
         # RTMP streamer (requires TWITCH_STREAM_KEY; optional for webrtc-only)
         if stream_key:
+            bgm = os.getenv("RTMP_BGM_PATH")
             self.rtmp_streamer = FFmpegRTMPStreamer(
                 stream_key=stream_key,
                 fps=9,
                 width=640,
                 height=480,
+                bgm_path=bgm,
             )
         else:
             self.rtmp_streamer = None
             print("⚠️ TWITCH_STREAM_KEY not set -- RTMP output disabled, WebRTC only")
 
         # WebRTC streamer (always available; no external secrets needed)
-        self.webrtc_streamer = WebRTCStreamer(fps=14, width=512, height=384)
+        self.webrtc_streamer = WebRTCStreamer(fps=9, width=512, height=384)
 
         self.text_overlay = TextOverlay(width=640, height=480)
 
@@ -170,7 +173,7 @@ class StreamingService:
             # Must happen BEFORE ltx_updates are applied so preset params
             # get merged, and before the generation loop starts.
             PRESET_PARAMS = {
-                "cohesive":  {"guidance_scale": 2.0, "noise_scale": 0.03},
+                "cohesive":  {"guidance_scale": 1.0, "noise_scale": 0.03},
                 "chaotic":   {"guidance_scale": 3.0, "noise_scale": 0.15},
                 "nightmare": {"guidance_scale": 3.5, "noise_scale": 0.20},
             }
@@ -218,7 +221,7 @@ class StreamingService:
             if effective_frame_rate is None and request.target_fps:
                 effective_frame_rate = float(request.target_fps)
             if effective_frame_rate is not None:
-                ltx_updates['frame_rate'] = float(effective_frame_rate)
+                self.video_streamer.update_ltx_config(frame_rate=float(effective_frame_rate))
                 print(f"   🎬 frame_rate: {effective_frame_rate} (audio duration matches stream playback)")
 
             # Toggle native audio (RTMP only; WebRTC always streams audio)
@@ -281,9 +284,13 @@ class StreamingService:
                 "message": f"Streaming started ({output_mode} mode).",
                 "output_mode": output_mode,
                 "twitch_channel_input": self.video_streamer.twitch_listener.channel_name,
-                "rtmp_url": self.rtmp_streamer.rtmp_url if self.rtmp_streamer else None,
+                "rtmp_url": "configured" if self.rtmp_streamer else None,
                 "initial_prompt": self.video_streamer.initial_prompt,
-                "initial_image_url": self.video_streamer.initial_image_url,
+                "initial_image_url": (
+                    "data:image/*;base64,<redacted>"
+                    if str(self.video_streamer.initial_image_url).startswith("data:image")
+                    else self.video_streamer.initial_image_url
+                ),
                 "configuration": {
                     "num_frames": self.video_streamer.ltx_config.num_frames,
                     "timesteps": self.video_streamer.ltx_config.timesteps,
@@ -343,7 +350,7 @@ class StreamingService:
 
         # Apply style preset if provided (swaps system prompt + overrides params)
         PRESET_PARAMS = {
-            "cohesive":  {"guidance_scale": 2.0, "noise_scale": 0.03},
+            "cohesive":  {"guidance_scale": 1.0, "noise_scale": 0.03},
             "chaotic":   {"guidance_scale": 3.0, "noise_scale": 0.15},
             "nightmare": {"guidance_scale": 3.5, "noise_scale": 0.20},
         }

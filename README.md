@@ -1,380 +1,289 @@
-# Realtime LTX Video Generation Demo
+# Infinite TV — AI-Generated Live Stream
 
-A real-time AI video generation system that creates dynamic content by listening to Twitch chat and streaming live AI-generated videos to RTMP endpoints. Built with LTX Video model, FAL serverless infrastructure, and a modern React dashboard.
+> **Fork of [alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv)** with Windows (RTX 5090 / Blackwell) support, local GPU inference, `torch.compile` acceleration, and production-tested Twitch streaming.
 
-## Features
+A real-time AI video generation system that listens to Twitch chat and streams live AI-generated videos. Built on the **LTX Video 2.3** distilled diffusion model, running entirely on a local GPU.
 
-- **Multiple Model Support**: Choose between LTX v1 (local HuggingFace) or LTX v2 Preview (fal.ai API)
-- **Real-time AI Video Generation**: Uses LTX Video model for high-quality video synthesis
-- **Twitch Chat Integration**: Listens to chat messages and generates contextual video content
-- **Live RTMP Streaming**: Streams generated videos directly to Twitch or other RTMP endpoints
-- **Real-time Dashboard**: Monitor generation metrics, queue status, and performance
-- **Text Overlays**: Dynamic text overlays on generated videos
-- **Serverless Deployment**: Runs on FAL's GPU infrastructure with auto-scaling
-- **Continuous Generation**: Seamless video loops with context preservation
+## What Changed in This Fork
 
-## Architecture
+### 🖥️ Full Windows Support
+- **RTMP streamer**: Replaced Unix FIFO pipes with Windows named pipes (`CreateNamedPipeW`) for audio streaming — the original only worked on Linux/macOS.
+- **Model loading**: Replaced hardcoded Linux paths (`/data/models/...`) with environment-variable-driven paths.
+- **File preloading**: Replaced `find | xargs cat` with a Python `ThreadPoolExecutor` fallback on Windows.
+- **Twitch listener**: Added UTF-8 encoding fixes for Windows console output.
 
-```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Twitch Chat   │───▶│  Prompt Generator │───▶│  LTX Video Gen  │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                                         │
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│  RTMP Stream    │◀───│   Text Overlay   │◀───│  Frame Processor │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │
-         ▼
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│     Twitch      │    │    Dashboard     │───▶│   Monitoring    │
-│   (Live Stream) │    │   (React App)    │    │   (WebSocket)   │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-```
+### ⚡ torch.compile Acceleration
+- Added **`torch.compile(mode="reduce-overhead")`** support for the transformer, gated by `LTX23_TORCH_COMPILE=true`.
+- On Windows, this requires [`triton-windows`](https://github.com/triton-lang/triton-windows) — install with `pip install triton-windows`.
+- **Performance impact**: ~150s → ~35s per generation segment on RTX 5090 (**~77% faster**).
+- Note: `max-autotune` mode doesn't work with triton-windows due to `CompiledKernel.launch_enter_hook` mismatch — `reduce-overhead` is used instead.
+- We also contributed a [compatibility fix (PR #53)](https://github.com/triton-lang/triton-windows/pull/53) back to triton-windows for a `triton_key` import error that blocked `torch.compile`.
 
-### Core Components
+### 🎛️ Configurable Inference Parameters
+- **Denoising steps**: Now configurable via `num_inference_steps` (default: 5). The original hardcoded 8 steps. Fewer steps = faster generation with the distilled model.
+- **Sigma schedule**: Automatically subsamples the distilled sigma values when using fewer than 8 steps.
+- **CPU offload toggle**: `LTX23_CPU_OFFLOAD` env var (default: `true`) — disable for GPUs with enough VRAM to keep everything on-device.
+- **Condition pipeline**: Lazy-loaded via `LOAD_LTX23_CONDITION=true` instead of always loading.
 
-- **`streaming_pipeline/`**: Main Python package with all video generation logic
-- **`dashboard/`**: Next.js React dashboard for monitoring and control
-- **`FAL App`**: Serverless deployment configuration
+### 🎵 Background Music (BGM)
+- Added `RTMP_BGM_PATH` support — loops an audio file as background music on the Twitch stream.
+- Audio mixing works alongside LTX 2.3's natively generated audio.
 
-## Quick Start
+### 📊 Other Improvements
+- WebRTC output mode alongside RTMP
+- Style presets (`cohesive`, `chaotic`, `nightmare`, `custom`)
+- Character reference support via `ltx-2.3-condition` mode
+- Hot-reloadable generation parameters via `/update_config`
+- Local LLM endpoint support for prompt generation (`LLM_BASE_URL`)
+
+---
+
+## Quick Start (Local GPU)
 
 ### Prerequisites
 
-- Python 3.11+
-- Node.js 18+
-- FFmpeg installed
-- FAL account and API key
-- OpenAI API key
-- Twitch account and stream key
+- **GPU**: NVIDIA with CUDA support (tested on RTX 5090 / Blackwell)
+- **Python 3.11+**
+- **Node.js 18+** (for dashboard)
+- **FFmpeg** installed and in PATH
+- **CUDA Toolkit** installed
+- Twitch account + stream key
+- OpenAI API key (for prompt generation)
 
 ### 1. Clone and Setup
 
 ```bash
-git clone <repository-url>
-cd realtime-ltx-video-generation-demo
+git clone https://github.com/dAAAb/infinite-tv.git
+cd infinite-tv
 
 # Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # Linux/macOS
 
-# Install Python dependencies
+# Install dependencies
 pip install -e .
+
+# (Optional, Windows only) Enable torch.compile acceleration
+pip install triton-windows
 ```
 
-### 2. Environment Configuration
+### 2. Download Models
 
-Create `.env` in the root directory:
-
-```env
-# Required API Keys
-OPENAI_API_KEY=your_openai_api_key_here
-GROQ_API_KEY=your_groq_api_key_here  # Optional, for faster inference
-
-# Twitch Configuration
-TWITCH_CHANNEL=shroud  # Channel to monitor (without #)
-TWITCH_STREAM_KEY=your_twitch_stream_key_here
-
-# FAL Configuration
-FAL_KEY=your_fal_api_key_here
-```
-
-### 3. Deploy to FAL
+The LTX 2.3 distilled model (~15 GB) downloads automatically on first run from HuggingFace. To pre-download:
 
 ```bash
-# Deploy the streaming pipeline
-fal deploy realtime-streaming
+python -c "from huggingface_hub import snapshot_download; snapshot_download('dg845/LTX-2.3-Distilled-Diffusers', local_dir='models/ltx-2.3-distilled-v2')"
 ```
 
-This will output various endpoints. Use the **Synchronous Endpoints** base URL for the dashboard.
+### 3. Environment Configuration
 
-### 4. Dashboard Setup
+Copy `.env.example` to `.env` and fill in:
+
+```env
+# Model selection
+LOAD_LTX23_PIPELINE=true
+LOAD_LOCAL_PIPELINE=false
+LOAD_LTX23_CONDITION=false
+
+# GPU settings
+LTX23_CPU_OFFLOAD=false          # Set false if you have enough VRAM (>24GB)
+LTX23_TORCH_COMPILE=true         # Requires triton-windows on Windows
+PRELOAD_MODEL_FILES=false
+
+# Model paths (auto-downloaded if not present)
+LTX23_WEIGHTS_DIR=./models/ltx-2.3-distilled-v2
+LTX_WEIGHTS_DIR=./models/ltx-video-0.9.8-13b
+
+# API keys
+OPENAI_API_KEY=your_key_here
+FAL_KEY=your_key_here             # Only needed for fal.ai cloud mode
+
+# Twitch
+TWITCH_CHANNEL=your_channel
+TWITCH_STREAM_KEY=your_stream_key
+
+# Optional
+RTMP_BGM_PATH=./outputs/bgm-lofi.mp3   # Background music
+RUN_GENERATION_INLINE=true
+
+# Optional: local LLM for prompt generation
+# LLM_BASE_URL=http://127.0.0.1:8080/v1
+# LLM_TEXT_MODEL=local
+```
+
+### 4. Start Backend
+
+```powershell
+# Windows (PowerShell)
+.\scripts\start-local.ps1
+```
+
+Or manually:
+
+```bash
+python -m uvicorn streaming_pipeline.local_app:app --host 127.0.0.1 --port 8000
+```
+
+### 5. Start Streaming
+
+```bash
+# Start stream via API
+curl -X POST http://127.0.0.1:8000/start_stream \
+  -H "Content-Type: application/json" \
+  -d '{"output_mode": "rtmp", "model": "ltx-2.3", "initial_image_url": "https://example.com/start-image.jpg"}'
+```
+
+Or use the dashboard at `http://127.0.0.1:3000` (run `cd dashboard && npm install && npm run dev`).
+
+### 6. Dashboard Setup
 
 ```bash
 cd dashboard
-
-# Install dependencies
 npm install
-
-# Create dashboard .env.local with required configuration
-cat > .env.local << EOF
-# FAL API configuration
-NEXT_PUBLIC_FAL_API_URL=https://fal.run/your-username/realtime-streaming
-FAL_KEY=your_fal_api_key_here
-EOF
-
-# Start development server
 npm run dev
 ```
 
-**Important**: The dashboard needs two environment variables:
-- `NEXT_PUBLIC_FAL_API_URL`: Your deployed FAL app URL (synchronous endpoint)
-- `FAL_KEY`: Your FAL API key (server-side only, for authentication)
+The dashboard connects to `http://127.0.0.1:8000` and provides real-time monitoring, stream controls, and parameter tuning.
 
-## Usage Guide
+---
 
-### Starting a Stream
+## Pitfalls & Gotchas 🕳️
 
-1. **Deploy to FAL**: `fal deploy realtime-streaming`
-2. **Start Dashboard**: `cd dashboard && npm run dev`
-3. **Configure Stream**: Use the dashboard to set generation parameters
-4. **Start Streaming**: Click "Start Stream" in the dashboard
+### Windows-Specific Issues
 
-### API Endpoints
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `torch.compile` fails with `ImportError: cannot import name 'triton_key'` | triton-windows missing compat shim for PyTorch Inductor | `pip install triton-windows` + our [triton_key shim](https://github.com/triton-lang/triton-windows/pull/53) |
+| `torch.compile` fails with `launch_enter_hook` error | `max-autotune` mode incompatible with triton-windows | Use `reduce-overhead` mode (already configured) |
+| RTMP audio breaks / pipe errors | Unix FIFOs (`mkfifo`) don't exist on Windows | This fork uses Windows named pipes — already fixed |
+| `UnicodeEncodeError` on console output | Windows console defaults to cp950/cp1252 | Set `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` |
+| `find | xargs cat` fails for model preloading | Unix command, not available on Windows | This fork uses Python `ThreadPoolExecutor` fallback |
 
-The FAL app exposes these endpoints:
+### General Issues
 
-- `POST /start_stream` - Start video generation and streaming
-- `POST /stop_stream` - Stop the streaming pipeline
-- `GET /metrics` - Get current performance metrics
-- `WebSocket /metrics/ws` - Real-time metrics stream
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| First generation takes 3-5 minutes | `torch.compile` warmup (compiling CUDA kernels) | Normal — subsequent generations are fast (~35s) |
+| Stream freezes between segments | Generation slower than playback | Reduce `num_frames` or `num_inference_steps`; enable `torch.compile` |
+| `initial_image_url` required error | No default start image | Pass a start image URL or base64 data URI in `/start_stream` |
+| VRAM OOM | Model too large for GPU | Enable `LTX23_CPU_OFFLOAD=true` or reduce resolution |
+| Twitch stream drops | FFmpeg RTMP timeout | Check `TWITCH_STREAM_KEY`; ensure stable network |
 
-### Authentication
+---
 
-All API requests to FAL endpoints require authentication. The dashboard handles this automatically:
+## Performance Benchmarks (RTX 5090, 24GB VRAM)
 
-**How it works:**
-1. All HTTP requests route through `/api/fal/proxy` (Next.js API route)
-2. The proxy adds `Authorization: Key ${FAL_KEY}` header server-side
-3. WebSocket connections use temporary JWT tokens (auto-refreshed every 5 minutes)
+| Configuration | Gen Time | RTMP FPS | Notes |
+|--------------|----------|----------|-------|
+| Baseline (8 steps, 17 frames, no compile) | ~248s | ~3.8 | Original upstream settings |
+| 5 steps, 9 frames, no compile | ~150s | ~3.8 | Reduced params only |
+| 5 steps, 9 frames, **torch.compile** | **~35s** | **~8.8** | 🔥 Recommended |
 
-**Using the helper functions:**
-```typescript
-import { startStream, stopStream, getMetrics } from '@/utils/falApi';
+With torch.compile at ~35s per segment and 9 frames sustaining ~54s of playback, the stream runs with **zero freeze time** between generations.
 
-// Start streaming
-await startStream(apiUrl, config);
+---
 
-// Stop streaming
-await stopStream(apiUrl);
+## API Reference
 
-// Get metrics
-const response = await getMetrics(apiUrl);
-const metrics = await response.json();
-```
+### `POST /start_stream`
 
-All authentication is handled automatically - you never need to manually add the FAL_KEY header in client-side code.
+Start video generation and RTMP streaming.
 
-### Request Format
-
-**LTX v1 (Local Pipeline):**
-```json
-{
-  "model": "ltxv1",
-  "initial_prompt": "A peaceful digital landscape",
-  "initial_image_url": "https://example.com/image.jpg",
-  "num_frames": 240,
-  "width": 640,
-  "height": 480,
-  "guidance_scale": 3.0,
-  "target_fps": 9.0,
-  "mode": "regular"
-}
-```
-
-**LTX 2.3 Fast (fal.ai API):**
 ```json
 {
   "model": "ltx-2.3",
-  "initial_prompt": "A cinematic video with smooth camera movement",
-  "initial_image_url": "https://example.com/image.jpg",
-  "duration": 6,
-  "resolution": "1080p",
-  "aspect_ratio": "16:9"
+  "output_mode": "rtmp",
+  "initial_image_url": "https://... or data:image/jpeg;base64,...",
+  "initial_prompt": "A cozy lo-fi study room",
+  "width": 512,
+  "height": 384,
+  "num_frames": 9,
+  "timesteps": [1000, 981, 909, 725, 0.03],
+  "guidance_scale": 1.0,
+  "target_fps": 9.0,
+  "style_preset": "cohesive",
+  "enable_audio": true
 }
 ```
 
-## Configuration
+### `POST /stop_stream`
 
-### Model Selection
+Stop the streaming pipeline.
 
-Choose between two video generation backends:
+### `POST /update_config`
 
-- **`ltxv1`** (default): Local HuggingFace LTX pipeline with full customization
-- **`ltx-2.3`**: fal.ai hosted LTX 2.3 Fast (22B model) with sharper output and faster inference
+Hot-reload generation parameters without stopping the stream.
 
-### Video Generation Parameters
+```json
+{
+  "num_frames": 9,
+  "guidance_scale": 1.5,
+  "noise_scale": 0.15,
+  "llm_temperature": 0.7,
+  "style_preset": "chaotic"
+}
+```
 
-**LTX v1 (Local Pipeline):**
-- **`num_frames`**: Number of frames to generate (default: 240)
-- **`width/height`**: Video resolution (default: 640x480)
-- **`guidance_scale`**: How closely to follow prompts (default: 3.0)
-- **`strength`**: Image-to-video influence (default: 1.0)
-- **`target_fps`**: Streaming frame rate (default: 9.0)
-- **`timesteps`**: Custom timesteps for diffusion process
+### `GET /metrics`
 
-**LTX 2.3 Fast (fal.ai API):**
-- **`duration`**: Video duration - 6 to 20 seconds (>10s requires 25fps and 1080p)
-- **`resolution`**: Output resolution - 1080p, 1440p, or 2160p
-- **`aspect_ratio`**: Video aspect ratio - auto, 16:9, or 9:16
+Returns real-time metrics: generation stats, RTMP status, GPU memory, Twitch chat status.
 
-### Streaming Configuration
+### `WebSocket /metrics/ws`
 
-- **`TWITCH_CHANNEL`**: Twitch channel to monitor for chat
-- **`TWITCH_STREAM_KEY`**: Your Twitch stream key for RTMP output
+Real-time metrics stream for the dashboard.
 
-### Generation Modes
-
-- **`regular`**: Standard generation with chat influence
-- **`nightmare`**: More chaotic, experimental generation
+---
 
 ## Project Structure
 
 ```
-realtime-ltx-video-generation-demo/
+infinite-tv/
 ├── streaming_pipeline/           # Main Python package
-│   ├── app.py                   # FAL app entry point
-│   ├── streaming_service.py     # Core streaming logic
-│   ├── models.py                # Pydantic models and types
+│   ├── local_app.py             # Local FastAPI entry point
+│   ├── app.py                   # FAL serverless entry point
+│   ├── streaming_service.py     # Orchestration layer
 │   ├── core/
 │   │   └── streaming_engine.py  # Main generation loop
 │   ├── video_generation/
-│   │   └── video_generator.py   # LTX model wrapper
+│   │   └── video_generator.py   # LTX model wrapper + torch.compile
 │   ├── input/
 │   │   └── twitch_listener.py   # Twitch chat integration
 │   ├── output/
-│   │   └── rtmp_streamer.py     # RTMP streaming via FFmpeg
+│   │   ├── rtmp_streamer.py     # RTMP via FFmpeg (Windows named pipes)
+│   │   └── webrtc_streamer.py   # WebRTC browser streaming
 │   ├── prompt_generation/
-│   │   └── prompt_generator.py  # AI prompt generation
+│   │   └── prompt_generator.py  # LLM-driven prompt generation
 │   ├── postprocessing/
-│   │   └── text_overlay.py     # Video text overlays
-│   ├── utils/
-│   │   ├── logger_config.py    # Logging configuration
-│   │   └── monitoring.py       # Performance monitoring
-│   └── prompts/
-│       ├── system_prompt.txt   # Base system prompt
-│       └── system_prompt_visual.txt  # Visual mode prompt
-├── dashboard/                   # React monitoring dashboard
-│   ├── app/                    # Next.js app directory
-│   ├── components/             # React components
-│   ├── hooks/                  # Custom React hooks
-│   └── utils/                  # Utility functions
-├── logs/                       # Application logs
-├── pyproject.toml             # Python package configuration
-├── requirements.txt           # Python dependencies
-└── README.md                  # This file
+│   │   └── text_overlay.py      # Video text overlays
+│   ├── models/
+│   │   ├── api.py               # Request/response models
+│   │   ├── video.py             # Video generation config
+│   │   └── streaming.py         # Streaming state
+│   └── utils/
+│       ├── logger_config.py
+│       └── monitoring.py
+├── dashboard/                    # Next.js React dashboard
+├── scripts/
+│   └── start-local.ps1          # Windows startup script
+├── models/                       # Downloaded model weights
+├── outputs/                      # Generated outputs + BGM
+├── .env.example                  # Environment template
+├── pyproject.toml
+├── requirements.txt
+└── README.md
 ```
 
-## Monitoring & Debugging
-
-### Logs
-
-The system creates separate log files in `logs/`:
-
-- **`server.log`**: API startup, configuration, health checks
-- **`generation.log`**: Video generation pipeline events
-- **`queue.log`**: RTMP streaming and queue monitoring
-
-### Dashboard Metrics
-
-The React dashboard shows:
-
-- **Generation Performance**: FPS, latency, success rates
-- **Queue Status**: Frame buffer levels, processing rates
-- **System Health**: Memory usage, error rates
-- **Chat Activity**: Recent messages and processing status
-
-### WebSocket Monitoring
-
-Real-time metrics are available via WebSocket at `/metrics/ws`:
-
-```javascript
-const ws = new WebSocket('wss://your-fal-url/metrics/ws');
-ws.onmessage = (event) => {
-  const metrics = JSON.parse(event.data);
-  console.log('Current metrics:', metrics);
-};
-```
-
-## Development
-
-### Local Development
-
-```bash
-# Install in development mode
-pip install -e .
-
-# Run the streaming pipeline for development
-fal run realtime-streaming
-```
-
-This will output various endpoints. For development, copy the **Synchronous Endpoints** base URL and update your dashboard's `.env.local`:
-
-```bash
-# Update dashboard with the development URL (copy the unique ID from terminal output)
-cd dashboard
-echo "NEXT_PUBLIC_FAL_API_URL=https://fal.run/unique-id-from-terminal/realtime-streaming" > .env.local
-```
-
-**Note**: The URL from `fal run` is temporary and will change each time you run the command. For persistent deployment, use `fal deploy realtime-streaming` instead.
-
-### Adding New Features
-
-1. **Video Effects**: Extend `postprocessing/text_overlay.py`
-2. **Chat Sources**: Add new input sources in `input/`
-3. **Generation Models**: Extend `video_generation/video_generator.py`
-4. **Streaming Outputs**: Add new outputs in `output/`
-
-### Code Structure Guidelines
-
-- **Models**: Define all data structures in `models.py`
-- **Logging**: Use the configured loggers from `utils/logger_config.py`
-- **Monitoring**: Implement `Monitorable` interface for new components
-- **Error Handling**: Use structured logging and graceful degradation
-
-## Troubleshooting
-
-### Common Issues
-
-**Dashboard Can't Connect to FAL App**
-- Check that `NEXT_PUBLIC_FAL_API_URL` in `dashboard/.env.local` matches your current FAL app URL
-- The FAL URL changes with each deployment - update it after running `fal run realtime-streaming`
-- Ensure the FAL app is running before starting the dashboard
-
-**Import Errors**
-```bash
-# Reinstall in editable mode
-pip install -e .
-```
-
-**FFmpeg Not Found**
-```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt-get install ffmpeg
-```
-
-**RTMP Connection Failed**
-- Verify `TWITCH_STREAM_KEY` is correct
-- Check firewall settings
-- Ensure FFmpeg has network permissions
-
-**Generation Timeouts**
-- Reduce `target_fps` for more manageable streaming rates
-- Check GPU availability in FAL logs
-- Monitor memory usage
-
-### Performance Optimization
-
-- **Reduce Resolution**: Lower `width`/`height` for faster processing
-- **Optimize Frame Rate**: Lower `target_fps` to reduce processing load
-- **Use Groq**: Add `GROQ_API_KEY` for faster prompt generation
-- **Monitor Queues**: Watch dashboard for bottlenecks
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-
+---
 
 ## Acknowledgments
 
-- **LTX Video Model**: Advanced video generation capabilities
-- **FAL**: Serverless GPU infrastructure
-- **Diffusers**: Hugging Face diffusion models library
-- **FFmpeg**: Video processing and streaming
+- **[alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv)** — Original project
+- **[LTX Video](https://huggingface.co/Lightricks)** — Video generation model
+- **[triton-windows](https://github.com/triton-lang/triton-windows)** — Triton on Windows
+- **[Diffusers](https://github.com/huggingface/diffusers)** — HuggingFace diffusion library
+- **FFmpeg** — Video processing and RTMP streaming
 
+## License
 
-
+MIT — see [LICENSE](LICENSE) file.

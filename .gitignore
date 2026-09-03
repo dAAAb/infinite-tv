@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+models/
+logs/
+outputs/
+streaming_pipeline.egg-info/
+__pycache__/
+*.py[cod]
+.next/
+node_modules/
