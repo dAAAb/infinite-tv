@@ -32,12 +32,14 @@ Merely having a `FAL_KEY` is no longer permission to spend money.
 - Local LTX 2.5 NVFP4 generation through ComfyUI.
 - Image-to-Video chaining after the first clip.
 - Pixel-exact visible seam: clip `N`'s streamed final frame equals clip `N+1`'s first streamed frame.
+- The exact post-repair committed tail is atomically snapshotted for restart recovery; ComfyUI's pre-repair output is never mistaken for stream state.
 - Transactional story state: a clip advances the handoff and prompt history only after all frames are accepted by RTMP.
 - LTX temporal-padding trim: a 121-frame request currently decodes 129 frames; frames 122–129 are discarded.
-- Border/corruption guard with adaptive 12% / 16% / 20% full-bleed repair.
+- Border/corruption guard for hard bars and soft chromatic/vignette halos, with adaptive full-bleed repair.
 - Local recovery segment after repeated bad generations, so the channel never deadlocks on one frame.
 - RTMP backpressure capped around one clip instead of accumulating minutes of latency.
-- Twitch comments rendered on stream copies only; the clean final frame continues the I2V chain.
+- Twitch comments are consumed FIFO one per clip, retained verbatim in the video prompt, rendered on stream copies only, and vision-audited for visible completion.
+- Anti-stall prompt checks catch both near-duplicate prose and recurring action/object loops, then force a concrete scene-changing beat with a looser image guide; a three-clip cooldown preserves narrative pacing.
 - Windows named-pipe audio/BGM support and orphaned-FFmpeg cleanup.
 
 ## Current measured result
@@ -52,7 +54,7 @@ RTX 5090, Windows, local ComfyUI LTX 2.5 NVFP4, 512×288, 121 requested frames:
 | Sustained RTMP rate | **8.9–9.0 / 9 FPS** | Twitch production run |
 | Snapshot | 90 clips, 10,948 frames | 0 dropped, 0 rejected, queue 9.4 s |
 | Recovery activity | 3 adaptive repairs | 0 forced recovery segments in that snapshot |
-| Automated continuity tests | **14 / 14 passing** | Seam, padding, border, recovery, queue and overlay checks |
+| Automated continuity tests | **26 / 26 passing** | Seam, persisted handoff, padding, soft halo, recovery, queue, comment control and provider checks |
 
 These numbers are workload- and driver-dependent. The honest production metric is the end-to-end cycle, not just the denoising kernel time.
 
@@ -108,6 +110,14 @@ The upstream project keeps output alive by replaying the last frame when its que
 ### 5. A huge queue makes interaction look broken
 
 A Twitch comment can be correctly received, selected and burned into frames yet remain invisible for minutes if those frames sit behind an oversized queue. Backpressure now targets 18 seconds. Comment text is displayed for roughly 85% of its clip and verified at the pixel level before send.
+
+### 6. A displayed comment is not necessarily an executed command
+
+The old prompt stage could select `鏡頭拉遠 這個生物戴上眼鏡` but silently turn it into “the creature notices glasses,” dropping both the camera move and the completed action. Comments are now authoritative FIFO commands: the original text is retained verbatim, every clause must be completed, and comment clips use a 0.65 image-guide strength because the distilled Comfy graph is fixed at CFG 1.0. A before/middle/end vision audit keeps an unfinished command active for up to three clips while later comments remain queued.
+
+### 7. Soft coloured halos are different from black bars
+
+The long chain often produced no crisp one-pixel border at all. Instead, saturation or luminance drifted gradually around several sides, forming the rounded rainbow/vignette halo visible in the Twitch captures. The detector now compares each outer strip with its adjacent inner strip on all four sides. Repair preserves the exact seam frame, then settles into a 10–16% full-bleed crop early in the clip so the repaired tail, not the contaminated perimeter, becomes the next I2V input.
 
 ## Reproduce the local RTX 5090 setup
 
@@ -264,6 +274,8 @@ Then explicitly select `ltx-2.3` or `h3-max`. Pricing and availability change; c
 4. **Autoregressive video needs maintenance.** Borders, posterization and saturation errors compound when every tail becomes the next input.
 5. **A live system needs a bounded failure mode.** Quality gates must recover instead of deadlocking.
 6. **Continuity has layers.** Exact pixels, continuous motion, narrative state and interaction latency are separate problems.
+7. **Displaying intent is not satisfying intent.** Viewer control needs a post-generation visual audit and bounded retries, not only an LLM prompt and subtitle.
+8. **Redact operational URLs.** A Twitch RTMP URL contains the stream key in its path; logs record only a redacted marker.
 
 ## Project structure
 
@@ -281,6 +293,7 @@ scripts/
   start-ltx25-stream.py                    reproducible local start request
 tests/
   test_i2v_continuity.py                   continuity/recovery/overlay tests
+  test_prompt_controls.py                  exact comments + anti-stall tests
   test_provider_safety.py                  fal.ai opt-in guard tests
 dashboard/                                 Next.js monitoring UI
 ```

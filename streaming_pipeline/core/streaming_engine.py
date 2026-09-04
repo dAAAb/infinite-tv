@@ -71,6 +71,7 @@ class RealtimeVideoStreamer(Monitorable):
         self._quality_reference: Dict[str, float] = {}
         self._rejected_clips: int = 0
         self._committed_handoff_sha256: str = ""
+        self._handoff_snapshot_path: str = ""
         self._border_guard_activations: int = 0
         self._border_repairs: int = 0
         # A strict visual gate must not be allowed to deadlock a live channel.
@@ -83,6 +84,14 @@ class RealtimeVideoStreamer(Monitorable):
         self._recovery_segments: int = 0
         self._queue_backpressure_waits: int = 0
         self._queue_backpressure_seconds: float = 0.0
+        # A displayed comment is not considered fulfilled until a vision audit
+        # confirms that every clause became visible. Unfinished commands remain
+        # sticky for a bounded number of clips while later chat stays queued.
+        self._active_comment_key: str = ""
+        self._comment_adherence_attempts: int = 0
+        self._comment_adherence_retries: int = 0
+        self._comment_adherence_failures: int = 0
+        self._last_comment_adherence: Dict[str, Any] = {}
         
         # Track generation parameters history (for metrics)
         self.generation_params_history = []
@@ -251,6 +260,30 @@ class RealtimeVideoStreamer(Monitorable):
         """Digest decoded pixels, independent of PNG/JPEG container metadata."""
         return hashlib.sha256(frame.convert("RGB").tobytes()).hexdigest()
 
+    def _persist_committed_handoff(self, frame: Image.Image) -> None:
+        """Atomically persist the exact clean tail used by the next I2V clip.
+
+        ComfyUI output files contain pre-repair pixels, so selecting its newest
+        PNG during a restart can roll the story back or restore a halo. This
+        snapshot is written only after RTMP accepts the complete clip and never
+        contains the stream-only subtitle overlay.
+        """
+        configured = os.getenv(
+            "LTX25_HANDOFF_SNAPSHOT",
+            os.path.join("logs", "last_committed_handoff.png"),
+        ).strip()
+        if not configured:
+            return
+        try:
+            target = os.path.abspath(configured)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            temporary = target + ".tmp.png"
+            frame.convert("RGB").save(temporary, format="PNG")
+            os.replace(temporary, target)
+            self._handoff_snapshot_path = target
+        except Exception as exc:
+            generation_log.warning(f"⚠️ Could not persist committed handoff: {exc}")
+
     def _frame_quality(self, frame: Image.Image) -> Dict[str, float]:
         """Cheap structural metrics for detecting feedback-loop collapse."""
         import numpy as np
@@ -270,6 +303,47 @@ class RealtimeVideoStreamer(Monitorable):
         edge_mask[:, -band:] = True
         edge = gray[edge_mask]
         inner = gray[band:-band, band:-band]
+        saturation = hsv[:, :, 1]
+        edge_saturation = saturation[edge_mask]
+        inner_saturation = saturation[band:-band, band:-band]
+
+        # Hard black/white bars are easy to detect. The long-running LTX chain
+        # more often produces a *soft* rounded halo: each perimeter strip shifts
+        # hue/saturation or luminance relative to the immediately adjacent strip,
+        # without a single sharp line. Compare all four sides locally so a dark
+        # subject in the centre is not mistaken for a vignette.
+        side_pairs = (
+            (rgb[:band, :, :], rgb[band:band * 2, :, :], gray[:band, :], gray[band:band * 2, :], saturation[:band, :], saturation[band:band * 2, :]),
+            (rgb[-band:, :, :], rgb[-band * 2:-band, :, :], gray[-band:, :], gray[-band * 2:-band, :], saturation[-band:, :], saturation[-band * 2:-band, :]),
+            (rgb[:, :band, :], rgb[:, band:band * 2, :], gray[:, :band], gray[:, band:band * 2], saturation[:, :band], saturation[:, band:band * 2]),
+            (rgb[:, -band:, :], rgb[:, -band * 2:-band, :], gray[:, -band:], gray[:, -band * 2:-band], saturation[:, -band:], saturation[:, -band * 2:-band]),
+        )
+        side_rgb_distances = []
+        side_luma_deltas = []
+        side_saturation_deltas = []
+        for outer_rgb, adjacent_rgb, outer_gray, adjacent_gray, outer_sat, adjacent_sat in side_pairs:
+            side_rgb_distances.append(float(
+                np.linalg.norm(outer_rgb.mean(axis=(0, 1)) - adjacent_rgb.mean(axis=(0, 1)))
+            ))
+            side_luma_deltas.append(float(outer_gray.mean() - adjacent_gray.mean()))
+            side_saturation_deltas.append(float(outer_sat.mean() - adjacent_sat.mean()))
+        soft_border_sides = sum(
+            distance > 30
+            or (distance > 20 and (abs(luma) > 9 or abs(sat_delta) > 15))
+            for distance, luma, sat_delta in zip(
+                side_rgb_distances,
+                side_luma_deltas,
+                side_saturation_deltas,
+            )
+        )
+        soft_luma_sides = sum(
+            distance > 18 and abs(luma) > 14
+            for distance, luma in zip(side_rgb_distances, side_luma_deltas)
+        )
+        soft_chroma_sides = sum(
+            distance > 22 and sat_delta > 15
+            for distance, sat_delta in zip(side_rgb_distances, side_saturation_deltas)
+        )
         horizontal_delta = np.abs(np.diff(gray, axis=0))
         vertical_delta = np.abs(np.diff(gray, axis=1))
         outer_y = max(2, int(round(gray.shape[0] * 0.22)))
@@ -291,6 +365,15 @@ class RealtimeVideoStreamer(Monitorable):
             "edge_extreme_fraction": float(((edge < 24) | (edge > 232)).mean()),
             "edge_mean": float(edge.mean()),
             "inner_mean": float(inner.mean()),
+            "edge_saturation_mean": float(edge_saturation.mean()),
+            "inner_saturation_mean": float(inner_saturation.mean()),
+            "perimeter_saturation_delta": float(edge_saturation.mean() - inner_saturation.mean()),
+            "perimeter_luma_delta": float(edge.mean() - inner.mean()),
+            "side_rgb_distance_mean": float(np.mean(side_rgb_distances)),
+            "side_rgb_distance_max": float(np.max(side_rgb_distances)),
+            "soft_border_sides": float(soft_border_sides),
+            "soft_luma_sides": float(soft_luma_sides),
+            "soft_chroma_sides": float(soft_chroma_sides),
             "outer_line_coverage": float(max(
                 row_line_coverage[outer_rows].max(),
                 col_line_coverage[outer_cols].max(),
@@ -325,7 +408,22 @@ class RealtimeVideoStreamer(Monitorable):
             quality["outer_line_coverage"] >= line_warning
             and quality["outer_line_gradient"] > 12
         )
-        return dark_border or bright_border or chromatic_frame or rectangular_frame
+        soft_chromatic_halo = (
+            quality["soft_border_sides"] >= 2
+            and quality["perimeter_saturation_delta"] > 16
+        )
+        soft_vignette = (
+            quality["soft_luma_sides"] >= 3
+            and abs(quality["perimeter_luma_delta"]) > 10
+        )
+        return (
+            dark_border
+            or bright_border
+            or chromatic_frame
+            or rectangular_frame
+            or soft_chromatic_halo
+            or soft_vignette
+        )
 
     def _border_repair_needed(self, frame: Image.Image) -> bool:
         """Require stronger evidence before altering pixels with a smooth zoom.
@@ -348,7 +446,27 @@ class RealtimeVideoStreamer(Monitorable):
             and quality["outer_line_gradient"] > 28
             and abs(mean_delta) > 30
         )
-        return dark_frame or bright_frame or chromatic_frame or strong_rectangle
+        soft_halo = (
+            quality["soft_border_sides"] >= 2
+            and quality["perimeter_saturation_delta"] > 18
+        ) or (
+            quality["soft_luma_sides"] >= 3
+            and abs(quality["perimeter_luma_delta"]) > 12
+        )
+        return dark_frame or bright_frame or chromatic_frame or strong_rectangle or soft_halo
+
+    def _border_repair_ratio(self, frame: Image.Image) -> float:
+        """Choose enough crop to remove a soft halo in one clip, not dozens."""
+        quality = self._frame_quality(frame)
+        sat_delta = quality["perimeter_saturation_delta"]
+        sides = quality["soft_border_sides"]
+        if sat_delta > 55 or sides >= 4:
+            return 0.16
+        if sat_delta > 35 or sides >= 3:
+            return 0.13
+        if sat_delta > 18 or sides >= 2:
+            return 0.10
+        return float(os.getenv("LTX25_BORDER_REPAIR_INSET_RATIO", "0.08"))
 
     def _progressive_full_bleed_crop(
         self,
@@ -484,6 +602,14 @@ class RealtimeVideoStreamer(Monitorable):
                 quality["outer_line_coverage"] > line_limit
                 and quality["outer_line_gradient"] > 20
             )
+            soft_border = (
+                quality["soft_border_sides"] >= 3
+                and quality["perimeter_saturation_delta"] > 24
+            ) or (
+                quality["soft_luma_sides"] >= 3
+                and abs(quality["perimeter_luma_delta"]) > 16
+            )
+            border = border or soft_border
             verdict = (
                 "RAINBOW" if rainbow else
                 "FLAT/DEAD" if flat else
@@ -499,7 +625,10 @@ class RealtimeVideoStreamer(Monitorable):
                 f"edge(d/b/x)={quality['edge_dark_fraction']:.2f}/"
                 f"{quality['edge_bright_fraction']:.2f}/"
                 f"{quality['edge_extreme_fraction']:.2f} "
-                f"line={quality['outer_line_coverage']:.2f} → {verdict}"
+                f"line={quality['outer_line_coverage']:.2f} "
+                f"halo(sides/sat/luma)={quality['soft_border_sides']:.0f}/"
+                f"{quality['perimeter_saturation_delta']:.0f}/"
+                f"{quality['perimeter_luma_delta']:.0f} → {verdict}"
             )
             return rainbow or flat or exposure or posterized or border
         except Exception as e:
@@ -546,6 +675,11 @@ class RealtimeVideoStreamer(Monitorable):
         self._recovery_segments = 0
         self._queue_backpressure_waits = 0
         self._queue_backpressure_seconds = 0.0
+        self._active_comment_key = ""
+        self._comment_adherence_attempts = 0
+        self._comment_adherence_retries = 0
+        self._comment_adherence_failures = 0
+        self._last_comment_adherence = {}
         generation_log.info(
             "🧭 Quality reference: "
             f"ext={self._quality_reference['extreme_fraction']:.3f}, "
@@ -604,6 +738,8 @@ class RealtimeVideoStreamer(Monitorable):
         self.prompt_generation_task = None
         self._retry_prompt_result = None
         self._consecutive_corrupt_rejections = 0
+        self._active_comment_key = ""
+        self._comment_adherence_attempts = 0
         
         # Reset metrics on all components
         if hasattr(self.prompt_generator, 'reset_metrics'):
@@ -700,7 +836,9 @@ class RealtimeVideoStreamer(Monitorable):
     async def _prepare_next_prompt(self):
         """Generate the next prompt while current video is generating - WITH VISUAL CONTEXT"""
         # Get recent comments
-        comments = self.twitch_listener.get_recent_comments(self.comments_lookback)
+        # Consume one command per clip in FIFO order. Pulling five at once caused
+        # four unselected comments to disappear from the queue permanently.
+        comments = self.twitch_listener.get_recent_comments(1)
         
         # Log LLM input details
         print(f"\n🤖 LLM INPUT for next generation:")
@@ -735,6 +873,7 @@ class RealtimeVideoStreamer(Monitorable):
         """Generate video using pre-prepared prompt or initial prompt for first generation"""
         cycle_start_time = time.time()
         prompt_result = None
+        comment_adherence = None
 
         # Track whether a user comment was used for dynamic parameter adjustment
         used_comment = False
@@ -763,7 +902,7 @@ class RealtimeVideoStreamer(Monitorable):
                 self.prompt_generation_task = None  # Reset for next iteration
             else:
                 # Fallback if no pre-generated prompt
-                comments = self.twitch_listener.get_recent_comments(self.comments_lookback)
+                comments = self.twitch_listener.get_recent_comments(1)
 
                 # Log fallback LLM input
                 print(f"\n🤖 FALLBACK LLM INPUT:")
@@ -834,14 +973,11 @@ class RealtimeVideoStreamer(Monitorable):
                     border_guard_active = self._border_guard_needed(handoff_frame)
                     border_repair_active = self._border_repair_needed(handoff_frame)
                     if border_guard_active:
-                        prompt_for_this_gen = (
-                            "The camera continuously pushes decisively into the actual scene "
-                            "throughout this shot, moving past the existing outer frame until "
-                            "scene content fills every edge and no border remains visible. "
-                            + prompt_for_this_gen
-                        )
                         self._border_guard_activations += 1
-                        print("🔎 Border guard: injecting a decisive full-bleed push-in")
+                        print(
+                            "🔎 Border guard: reserving deterministic full-bleed repair "
+                            "without overriding the story/camera prompt"
+                        )
             # ─────────────────────────────────────────────────────────────────
 
             current_frame_preview = frame_for_this_gen[:50] + "..." if frame_for_this_gen else "None"
@@ -864,6 +1000,16 @@ class RealtimeVideoStreamer(Monitorable):
                     "strength": comment_params.strength
                 })
                 print(f"🎯 Using COMMENT mode: guidance={comment_params.guidance_scale}, strength={comment_params.strength}")
+            elif prompt_result is not None and getattr(prompt_result, "forced_novelty", False):
+                novelty_strength = float(os.getenv("LTX25_NOVELTY_STRENGTH", "0.78"))
+                request_dict["strength"] = min(
+                    float(request_dict["strength"]),
+                    novelty_strength,
+                )
+                print(
+                    f"🔀 Using ANTI-STALL mode: strength={request_dict['strength']} "
+                    "to let the new beat visibly change the scene"
+                )
             else:
                 print(f"🌱 Using EVOLUTION mode: guidance={request_dict['guidance_scale']}, strength={request_dict['strength']}")
 
@@ -908,10 +1054,18 @@ class RealtimeVideoStreamer(Monitorable):
             generation_duration = time.time() - generation_start_time
             cycle_duration = time.time() - cycle_start_time
 
-            if border_repair_active and video_result.frames:
-                video_result.frames = self._progressive_full_bleed_crop(video_result.frames)
+            if border_guard_active and video_result.frames:
+                repair_ratio = self._border_repair_ratio(handoff_frame)
+                video_result.frames = self._progressive_full_bleed_crop(
+                    video_result.frames,
+                    ratio=repair_ratio,
+                    settle_fraction=0.30,
+                )
                 self._border_repairs += 1
-                print("🔎 Border repair: applied seamless progressive full-bleed crop")
+                print(
+                    f"🔎 Border repair: applied {repair_ratio:.0%} early-settling "
+                    "full-bleed crop"
+                )
 
             # Reject a poisoned clip before it reaches either Twitch or the next
             # generation. Sampling the whole clip also catches gradual posterization.
@@ -1002,9 +1156,49 @@ class RealtimeVideoStreamer(Monitorable):
             else:
                 generation_log.error("❌ Unknown frame streaming issue")
 
+            # Rendering the subtitle proves only that the command was displayed.
+            # Audit the actual generated sequence before deciding whether the
+            # viewer intent may leave the active-control state.
+            if (
+                clip_committed
+                and selected_comment
+                and not recovery_segment
+                and hasattr(self.prompt_generator, "verify_comment_adherence")
+            ):
+                try:
+                    before_frame = self._base64_to_frame(frame_for_this_gen)
+                    comment_adherence = await asyncio.to_thread(
+                        self.prompt_generator.verify_comment_adherence,
+                        selected_comment,
+                        before_frame,
+                        video_result.frames,
+                    )
+                except Exception as exc:
+                    # The frames are already accepted by RTMP. A transient QA
+                    # failure must not prevent their tail from becoming the next
+                    # I2V handoff, otherwise stream and generation state diverge.
+                    comment_adherence = {
+                        "satisfied": None,
+                        "skipped": True,
+                        "reason": str(exc)[:200],
+                    }
+                    generation_log.warning(
+                        f"⚠️ Comment visual audit skipped without breaking handoff: {exc}"
+                    )
+                self._last_comment_adherence = comment_adherence or {}
+                generation_log.info(
+                    "🎯 COMMENT VISUAL AUDIT: "
+                    f"satisfied={comment_adherence.get('satisfied')} "
+                    f"progressing={comment_adherence.get('progressing')} "
+                    f"missing={comment_adherence.get('missing', [])} "
+                    f"summary={comment_adherence.get('summary', '')}"
+                )
+
             # Transaction boundary: a rejected/unaccepted clip must not change either
             # the I2V handoff frame or the story history.
             if not clip_committed:
+                if prompt_result is not None:
+                    self._retry_prompt_result = prompt_result
                 self._rejected_clips += 1
                 generation_log.warning(
                     f"↩️ Clip not committed (rejected total={self._rejected_clips}); "
@@ -1024,6 +1218,7 @@ class RealtimeVideoStreamer(Monitorable):
                 last_frame_base64 = self._frame_to_base64(last_pil)
                 self._last_good_frame_base64 = last_frame_base64
                 self._committed_handoff_sha256 = self._frame_digest(last_pil)
+                self._persist_committed_handoff(last_pil)
             else:
                 generation_log.error("❌ No frames in video result for state update")
                 return
@@ -1035,6 +1230,46 @@ class RealtimeVideoStreamer(Monitorable):
             if not recovery_segment:
                 self.state.current_prompt = prompt_to_use
                 self.state.previous_prompts.append(prompt_to_use)
+
+            if selected_comment and comment_adherence is not None:
+                comment_key = f"{selected_comment.username}\n{selected_comment.message}"
+                if comment_key != self._active_comment_key:
+                    self._active_comment_key = comment_key
+                    self._comment_adherence_attempts = 0
+                self._comment_adherence_attempts += 1
+                satisfied = comment_adherence.get("satisfied")
+                max_attempts = max(1, int(os.getenv("COMMENT_MAX_ADHERENCE_ATTEMPTS", "3")))
+                if satisfied is False and self._comment_adherence_attempts < max_attempts:
+                    missing = comment_adherence.get("missing") or [selected_comment.message]
+                    if not isinstance(missing, list):
+                        missing = [str(missing)]
+                    missing_text = "; ".join(str(item) for item in missing)[:400]
+                    retry_prompt = (
+                        f'The viewer command is still active and must be completed now: '
+                        f'"{selected_comment.message}". The prior clip left these clauses '
+                        f'unfinished: {missing_text}. Make the completed result large, '
+                        "central, and unmistakably visible while continuing from frame zero."
+                    )
+                    self._retry_prompt_result = type(prompt_result)(
+                        selected_comment=selected_comment,
+                        prompt=retry_prompt,
+                        reasoning="Vision audit kept the original viewer command active",
+                    )
+                    self._comment_adherence_retries += 1
+                    generation_log.warning(
+                        f"🔁 Viewer command remains active for attempt "
+                        f"{self._comment_adherence_attempts + 1}/{max_attempts}: "
+                        f"{missing_text}"
+                    )
+                else:
+                    if satisfied is False:
+                        self._comment_adherence_failures += 1
+                        generation_log.warning(
+                            f"⚠️ Viewer command audit still incomplete after {max_attempts} clips; "
+                            "releasing it to avoid deadlocking the story"
+                        )
+                    self._active_comment_key = ""
+                    self._comment_adherence_attempts = 0
             generation_log.info(
                 f"🔗 Committed streamed tail as next I2V first frame: "
                 f"{self._committed_handoff_sha256[:12]}"
@@ -1061,6 +1296,7 @@ class RealtimeVideoStreamer(Monitorable):
             "generation_params_history": self.generation_params_history,
             "rejected_clips": self._rejected_clips,
             "committed_handoff_sha256": self._committed_handoff_sha256,
+            "handoff_snapshot_ready": bool(self._handoff_snapshot_path),
             "quality_reference": self._quality_reference,
             "border_guard_activations": self._border_guard_activations,
             "border_repairs": self._border_repairs,
@@ -1068,6 +1304,11 @@ class RealtimeVideoStreamer(Monitorable):
             "recovery_segments": self._recovery_segments,
             "consecutive_corrupt_rejections": self._consecutive_corrupt_rejections,
             "prompt_retry_cached": self._retry_prompt_result is not None,
+            "active_comment": bool(self._active_comment_key),
+            "comment_adherence_attempts": self._comment_adherence_attempts,
+            "comment_adherence_retries": self._comment_adherence_retries,
+            "comment_adherence_failures": self._comment_adherence_failures,
+            "last_comment_adherence": self._last_comment_adherence,
             "queue_backpressure_waits": self._queue_backpressure_waits,
             "queue_backpressure_seconds": round(self._queue_backpressure_seconds, 1),
         }

@@ -5,8 +5,11 @@ from pydantic import BaseModel, Field
 
 class UserCommentParams(BaseModel):
     """Parameter overrides when using user comments"""
-    guidance_scale: float = Field(default=5.0, description="Higher guidance to follow user comment closely")
-    strength: float = Field(default=1.0, description="Lower strength for visual creativity")
+    # LTX 2.5 distilled runs at CFG 1.0; the Comfy graph intentionally ignores
+    # higher CFG values. Prompt adherence is controlled here by weakening the
+    # first-frame guide while frame zero is still replaced with the exact handoff.
+    guidance_scale: float = Field(default=1.0, description="LTX 2.5 distilled CFG")
+    strength: float = Field(default=0.65, description="Looser image guide for visible viewer-requested changes")
 
 
 @dataclass

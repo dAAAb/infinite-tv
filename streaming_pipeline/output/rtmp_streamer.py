@@ -79,7 +79,8 @@ class FFmpegRTMPStreamer(Monitorable):
             print(f"   Resolution: {self.width}x{self.height}")
             print(f"   FPS: {self.fps}")
             print(f"   Audio: {'native (LTX 2.3 vocoder)' if self.enable_audio else 'silent (anullsrc)'}")
-            print(f"   RTMP URL: {self.rtmp_url[:50]}...")
+            # The path is the Twitch stream key. Never emit even a prefix of it.
+            print("   RTMP URL: configured (<stream-key redacted>)")
             self.placeholder_frame = self._load_placeholder_frame()
 
             video_in = ffmpeg.input(
@@ -194,7 +195,7 @@ class FFmpegRTMPStreamer(Monitorable):
             self.monitor_thread.start()
 
             queue_log.info(f"✅ FFmpeg RTMP stream started - NOW LIVE ON TWITCH!")
-            queue_log.info(f"🔗 RTMP URL: {self.rtmp_url}")
+            queue_log.info("🔗 RTMP URL: configured (<stream-key redacted>)")
             queue_log.info(f"📐 Resolution: {self.width}x{self.height} @ {self.fps}fps")
 
         except Exception as e:

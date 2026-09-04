@@ -31,6 +31,25 @@ if ($conn) {
 }
 
 New-Item -ItemType Directory -Force -Path "logs" | Out-Null
+# Older builds logged the Twitch ingest URL verbatim; its path is the stream
+# key. Redact historical occurrences while the backend file handles are closed
+# so ignored local logs cannot become a future secret leak.
+Get-ChildItem -LiteralPath "logs" -File -Filter "*.log" -ErrorAction SilentlyContinue |
+  ForEach-Object {
+    try {
+      $raw = [IO.File]::ReadAllText($_.FullName)
+      $clean = [regex]::Replace(
+        $raw,
+        'rtmp://live\.twitch\.tv/app/[^\s"''\r\n]+',
+        'rtmp://live.twitch.tv/app/<redacted>'
+      )
+      if ($clean -ne $raw) {
+        [IO.File]::WriteAllText($_.FullName, $clean, [Text.UTF8Encoding]::new($false))
+      }
+    } catch {
+      Write-Warning "Could not redact active log $($_.Name): $($_.Exception.Message)"
+    }
+  }
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 # Continuity-first LTX-2.5 mode: do not repeatedly inject a visual style prompt.

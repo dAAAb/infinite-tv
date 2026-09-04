@@ -3,8 +3,12 @@ import os
 import openai
 import requests
 import base64
+import io
+import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import List, Optional, Dict, Any
+from PIL import Image
 from streaming_pipeline.models import TwitchComment
 from streaming_pipeline.models import StreamingState, Monitorable
 
@@ -22,6 +26,7 @@ class PromptResult:
     selected_comment: Optional[TwitchComment]  # None for evolution
     prompt: str
     reasoning: str
+    forced_novelty: bool = False
 
 VISUAL_MODE = True
 
@@ -147,14 +152,23 @@ CONTINUITY RULES:
 4. Transitions through doors, corridors, camera movement -- not cuts
 
 WHEN CHAT COMMENTS EXIST:
-1. Pick the most interesting comment
-2. Make it something the CHARACTER encounters or reacts to within the story
-3. Don't break the scene -- WEAVE the comment into the narrative
+1. Treat the FIRST comment as an authoritative director command, not a suggestion
+2. Copy its text exactly into selected_comment
+3. Execute EVERY clause visibly and literally during this clip, including camera
+   movement, object changes, clothing/accessories, and transformations
+4. Do not weaken an action: "wears glasses" cannot become "finds glasses";
+   "becomes human" cannot stop at "begins to transform"
+5. Preserve continuity by animating the requested change from the current frame,
+   but the requested end state must be unmistakably reached
 
 WHEN NO COMMENTS:
 1. Follow the STORY RHYTHM above based on the current clip number
 2. Give the character something to DO, not just something to look at
 3. Build toward the next beat in the rhythm
+4. Compare against the last five prompts. Never repeat the same subject-action-
+   object beat, emotional reaction, or investigate/recoil/approach loop
+5. If the scene has repeated a micro-action twice, introduce a concrete new
+   object, character, consequence, or continuous location transition now
 
 STYLE:
 - Write what the CHARACTER DOES, not what the camera sees
@@ -170,7 +184,7 @@ to notice something is off. Build dread through the character's growing unease.
 
 CRITICAL: Respond with VALID JSON ONLY.
 JSON Format:
-{{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "what the character DOES next in the story", "reasoning": "how this advances the story rhythm"}}"""
+{{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "all requested actions completed visibly, or a genuinely new story beat", "reasoning": "how this advances the story rhythm"}}"""
 
 STYLE_PRESETS = {
     "cohesive": {
@@ -267,6 +281,12 @@ class PromptGenerator(Monitorable):
         self.last_generation_time = 0.0
         self.last_provider = "none"
         self.last_model = "none"
+        self.comment_contracts_enforced = 0
+        self.repetitive_prompts_rewritten = 0
+        self.last_anti_stall_generation = -999
+        self.comment_adherence_checks = 0
+        self.comment_adherence_passes = 0
+        self.last_comment_adherence: Dict[str, Any] = {}
 
     def set_style_preset(self, name: str) -> None:
         """Apply a named style preset (system prompt + temperature)."""
@@ -327,6 +347,208 @@ class PromptGenerator(Monitorable):
         if client is self.groq_client:
             return "Groq"
         return "OpenAI"
+
+    @staticmethod
+    def _prompt_similarity(candidate: str, previous_prompts: List[str]) -> float:
+        """Return the strongest textual similarity to recent committed beats."""
+        candidate = " ".join((candidate or "").lower().split())
+        if not candidate:
+            return 1.0
+        scores = [
+            SequenceMatcher(None, candidate, " ".join((old or "").lower().split())).ratio()
+            for old in previous_prompts[-6:]
+            if old
+        ]
+        return max(scores, default=0.0)
+
+    @staticmethod
+    def _repeated_story_terms(candidate: str, previous_prompts: List[str]) -> List[str]:
+        """Find recurring action/object terms that lexical similarity can miss.
+
+        A loop such as ``approach orb -> recoil -> approach orb`` often uses
+        different sentence structure, so SequenceMatcher alone sees it as new.
+        Requiring two candidate terms to have appeared in at least two recent
+        beats catches that semantic orbit without treating a recurring hero as
+        a loop by itself.
+        """
+        stop_words = {
+            "about", "after", "again", "against", "around", "before", "being",
+            "character", "cinematic", "closely", "creature", "current", "eyes",
+            "frame", "from", "gently", "heart", "itself", "moment", "protagonist",
+            "scene", "slowly", "suddenly", "their", "there", "through", "toward",
+            "towards", "while", "with", "without", "woman", "person", "animal",
+            "human", "child", "camera", "continues", "continue", "directly",
+            "provided", "first", "image", "content", "edges", "border", "vignette",
+            "letterbox", "picture", "screen", "full", "bleed", "cut", "keep",
+            "cub", "cat", "dog", "head", "ears",
+        }
+
+        def terms(text: str) -> set:
+            return {
+                token
+                for token in re.findall(r"[a-z]{4,}", (text or "").lower())
+                if token not in stop_words
+            }
+
+        candidate_terms = terms(candidate)
+        recent_sets = []
+        seen_prompts = set()
+        for prompt in previous_prompts[-6:]:
+            normalized = " ".join((prompt or "").lower().split())
+            if normalized and normalized not in seen_prompts:
+                seen_prompts.add(normalized)
+                recent_sets.append(terms(prompt))
+        if len(recent_sets) < 3:
+            return []
+        return sorted(
+            token
+            for token in candidate_terms
+            if sum(token in old for old in recent_sets) >= 2
+        )
+
+    @staticmethod
+    def _enforce_comment_contract(prompt: str, comment: TwitchComment) -> str:
+        """Keep the original Twitch instruction in the actual video prompt.
+
+        The vision LLM is useful for translating a request into the current story,
+        but it must not be allowed to silently drop a camera clause or weaken a
+        transformation. LTX's Gemma text encoder is multilingual, so retaining the
+        exact Twitch text is also a useful second source of control.
+        """
+        message = (comment.message or "").strip()
+        return (
+            f'Viewer director command -- execute every clause literally and finish '
+            f'the visible result in this clip: "{message}". {prompt.strip()}'
+        )
+
+    def _rewrite_repetitive_prompt(self, client, model: str, formatted_prompt: str,
+                                   candidate: str, context: StreamingState) -> str:
+        """Request one compact rewrite when the story is looping in place."""
+        recent = context.previous_prompts[-6:] if context.previous_prompts else []
+        revision_messages = [
+            {"role": "system", "content": formatted_prompt},
+            {
+                "role": "user",
+                "content": (
+                    "REJECTED FOR REPETITION. The proposed beat was:\n"
+                    f"{candidate}\n\nRecent beats were:\n- "
+                    + "\n- ".join(recent)
+                    + "\nReturn JSON with selected_comment=null and a replacement prompt "
+                      "that causes one unmistakable, irreversible visual development. "
+                      "Do not repeat approaching, staring, hesitating, reaching, splashing, "
+                      "or reacting to the same object. Keep it one continuous shot."
+                ),
+            },
+        ]
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=revision_messages,
+                max_tokens=300,
+                temperature=max(0.65, self.temperature),
+                response_format={"type": "json_object"},
+            )
+            replacement = json.loads(response.choices[0].message.content).get("prompt", "").strip()
+            if replacement and self._prompt_similarity(replacement, recent) < 0.56:
+                return replacement
+        except Exception as exc:
+            print(f"⚠️ Anti-stall rewrite failed, using local escape beat: {exc}")
+
+        escape_beats = (
+            "A new character enters urgently and leads the protagonist away from the repeated action into a different area, in one continuous tracking shot.",
+            "The object activates decisively, transforming the surroundings and forcing the protagonist to make a visible choice.",
+            "A passage opens in the current setting; the protagonist leaves the old spot and enters it without a cut.",
+            "The repeated situation resolves abruptly, revealing a concrete new obstacle that the protagonist immediately confronts.",
+        )
+        return escape_beats[context.generation_count % len(escape_beats)]
+
+    @staticmethod
+    def _frame_data_uri(frame: Image.Image) -> str:
+        image = frame.convert("RGB")
+        image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=78, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def verify_comment_adherence(self, comment: TwitchComment, before_frame: Image.Image,
+                                 frames: List[Image.Image]) -> Dict[str, Any]:
+        """Audit a comment-controlled clip and identify clauses still unfinished.
+
+        This runs only for viewer-controlled clips. It lets long transformations
+        continue across a bounded number of segments instead of declaring success
+        merely because the comment subtitle was rendered.
+        """
+        if not frames:
+            return {"satisfied": False, "progressing": False, "missing": [comment.message]}
+
+        client = self.openai_client
+        model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+        if client is None and self.local_client is not None and self.local_vision_model:
+            client = self.local_client
+            model = self.local_vision_model
+        if client is None and self.groq_client is not None:
+            client = self.groq_client
+            model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        if client is None:
+            return {"satisfied": None, "skipped": True, "reason": "no vision client"}
+
+        sample_indices = sorted({len(frames) // 2, len(frames) - 1})
+        content: List[Dict[str, Any]] = [{
+            "type": "text",
+            "text": (
+                f'Viewer command: "{comment.message}"\n'
+                "The images are chronological: BEFORE, MIDDLE, END. Check every "
+                "clause literally. Camera movement must be visible across the sequence; "
+                "an accessory must be worn, not merely nearby; a requested transformation "
+                "must reach the requested final identity, not merely begin."
+            ),
+        }]
+        labelled_frames = [("BEFORE", before_frame)] + [
+            ("MIDDLE" if index != len(frames) - 1 else "END", frames[index])
+            for index in sample_indices
+        ]
+        for label, frame in labelled_frames:
+            content.append({"type": "text", "text": label})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": self._frame_data_uri(frame), "detail": "low"},
+            })
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a strict visual QA auditor for a continuous generated video. "
+                            "Return JSON only: satisfied is true only when every viewer-command "
+                            "clause is visibly completed; progressing is true for meaningful but "
+                            "unfinished progress; missing lists concise unfinished clauses; summary "
+                            "briefly states the evidence."
+                        ),
+                    },
+                    {"role": "user", "content": content},
+                ],
+                max_tokens=220,
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            result = json.loads(response.choices[0].message.content)
+            audit = {
+                "satisfied": bool(result.get("satisfied")),
+                "progressing": bool(result.get("progressing")),
+                "missing": result.get("missing") or [],
+                "summary": str(result.get("summary") or "")[:300],
+            }
+            self.comment_adherence_checks += 1
+            if audit["satisfied"]:
+                self.comment_adherence_passes += 1
+            self.last_comment_adherence = audit
+            return audit
+        except Exception as exc:
+            print(f"⚠️ Comment visual audit skipped: {exc}")
+            return {"satisfied": None, "skipped": True, "reason": str(exc)[:200]}
 
     def generate_prompt(self, comments: List[TwitchComment], context: StreamingState) -> PromptResult:
         """Generate prompt with Groq for both text and vision"""
@@ -468,24 +690,65 @@ class PromptGenerator(Monitorable):
                 # Track output size
                 self.last_output_length = len(result.get('prompt', '') + result.get('reasoning', ''))
                 
-                # Find the selected comment (if any)
+                prompt_text = str(result['prompt']).strip()
                 selected_comment = None
-                if comments and result.get('selected_comment') != "null":
-                    selected_comment = self._find_comment(comments, result['selected_comment'])
-                
+                forced_novelty = False
+                if comments:
+                    # The listener is consumed one item per clip. A queued viewer
+                    # instruction is authoritative and must never disappear merely
+                    # because the LLM returned selected_comment=null.
+                    selected_comment = comments[0]
+                    prompt_text = self._enforce_comment_contract(prompt_text, selected_comment)
+                    self.comment_contracts_enforced += 1
+                else:
+                    similarity = self._prompt_similarity(
+                        prompt_text,
+                        context.previous_prompts,
+                    )
+                    repeated_terms = self._repeated_story_terms(
+                        prompt_text,
+                        context.previous_prompts,
+                    )
+                    stalled = similarity >= 0.56 or len(repeated_terms) >= 2
+                    anti_stall_due = (
+                        context.generation_count - self.last_anti_stall_generation >= 3
+                    )
+                    if stalled and anti_stall_due:
+                        original = prompt_text
+                        prompt_text = self._rewrite_repetitive_prompt(
+                            client,
+                            model,
+                            formatted_prompt,
+                            prompt_text,
+                            context,
+                        )
+                        forced_novelty = True
+                        self.repetitive_prompts_rewritten += 1
+                        self.last_anti_stall_generation = context.generation_count
+                        print(
+                            f"🔀 Anti-stall rewrite ({similarity:.2f} similarity; "
+                            f"repeated={repeated_terms}): "
+                            f"{original} -> {prompt_text}"
+                        )
+
                 return PromptResult(
                     selected_comment=selected_comment,
-                    prompt=result['prompt'],
-                    reasoning=result['reasoning']
+                    prompt=prompt_text,
+                    reasoning=result['reasoning'],
+                    forced_novelty=forced_novelty,
                 )
                 
             except (json.JSONDecodeError, KeyError, AttributeError) as e:
                 print(f"AI parsing failed: {e}")
                 # Simple fallback - EXACTLY like the original code
                 if comments:
+                    selected_comment = comments[0]
                     return PromptResult(
-                        selected_comment=comments[0] if comments else None,
-                        prompt=f"{context.current_scene}, {comments[0].message[:50] if comments[0] and comments[0].message else 'evolving'}, cinematic",
+                        selected_comment=selected_comment,
+                        prompt=self._enforce_comment_contract(
+                            f"Continue the current scene while visibly completing the command.",
+                            selected_comment,
+                        ),
                         reasoning="AI parsing failed, used first comment"
                     )
                 else:
@@ -497,6 +760,17 @@ class PromptGenerator(Monitorable):
                     
         except Exception as e:
             print(f"❌ OpenAI API error: {e}")
+            # Never discard a queued viewer instruction on an API error.
+            if comments:
+                selected_comment = comments[0]
+                return PromptResult(
+                    selected_comment=selected_comment,
+                    prompt=self._enforce_comment_contract(
+                        "Continue from the current frame and visibly complete the command.",
+                        selected_comment,
+                    ),
+                    reasoning=f"API error; preserved viewer command: {e}",
+                )
             # Fallback to simple evolution
             return PromptResult(
                 selected_comment=None,
@@ -530,6 +804,12 @@ class PromptGenerator(Monitorable):
         self.last_generation_time = 0.0
         self.last_provider = "none"
         self.last_model = "none"
+        self.comment_contracts_enforced = 0
+        self.repetitive_prompts_rewritten = 0
+        self.last_anti_stall_generation = -999
+        self.comment_adherence_checks = 0
+        self.comment_adherence_passes = 0
+        self.last_comment_adherence = {}
         print("🧹 Prompt generation metrics reset")
     
     def get_status(self) -> Dict[str, Any]:
@@ -543,4 +823,10 @@ class PromptGenerator(Monitorable):
             "last_generation_time": round(self.last_generation_time, 3),
             "provider": self.last_provider,
             "model": self.last_model,
+            "comment_contracts_enforced": self.comment_contracts_enforced,
+            "repetitive_prompts_rewritten": self.repetitive_prompts_rewritten,
+            "last_anti_stall_generation": self.last_anti_stall_generation,
+            "comment_adherence_checks": self.comment_adherence_checks,
+            "comment_adherence_passes": self.comment_adherence_passes,
+            "last_comment_adherence": self.last_comment_adherence,
         }

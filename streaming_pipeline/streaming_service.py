@@ -259,7 +259,12 @@ class StreamingService:
                     print(f"   📝 Custom prompt: {request.initial_prompt}")
                     self.video_streamer.initial_prompt = request.initial_prompt
                 if request.initial_image_url:
-                    print(f"   🖼️ Custom image: {request.initial_image_url}")
+                    image_label = (
+                        "data:image/*;base64,<redacted>"
+                        if str(request.initial_image_url).startswith("data:image")
+                        else request.initial_image_url
+                    )
+                    print(f"   🖼️ Custom image: {image_label}")
                     self.video_streamer.initial_image_url = request.initial_image_url
             else:
                 print(f"�� Using default initial state:")

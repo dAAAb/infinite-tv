@@ -1,5 +1,7 @@
 import base64
 import io
+import os
+import tempfile
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -9,6 +11,8 @@ from PIL import Image
 
 from streaming_pipeline.core.streaming_engine import RealtimeVideoStreamer
 from streaming_pipeline.models import LTXVideoResponseWithFrames, StreamingState
+from streaming_pipeline.models import TwitchComment
+from streaming_pipeline.prompt_generation.prompt_generator import PromptResult
 from streaming_pipeline.video_generation.comfy_ltx25_backend import (
     _build_prompt_i2v_video_only,
     _prepare_handoff_frame,
@@ -90,6 +94,29 @@ class QualityGateTests(unittest.TestCase):
         streamer = _streamer_for_quality(healthy)
 
         self.assertTrue(streamer._border_guard_needed(framed))
+
+    def test_soft_saturated_halo_triggers_guard_and_stronger_repair(self):
+        y, x = np.indices((144, 256))
+        base = np.dstack([
+            70 + x * 0.25,
+            85 + y * 0.45,
+            95 + (x + y) * 0.18,
+        ]).clip(0, 255).astype(np.uint8)
+        healthy = Image.fromarray(base, "RGB")
+        halo = base.astype(np.float32)
+        distance = np.minimum.reduce([x, 255 - x, y, 143 - y]).astype(np.float32)
+        alpha = np.clip((18 - distance) / 18, 0, 1)[..., None]
+        saturated_edge = np.zeros_like(halo)
+        saturated_edge[..., 0] = 210
+        saturated_edge[..., 1] = 25
+        saturated_edge[..., 2] = 190
+        halo = (halo * (1 - alpha) + saturated_edge * alpha).astype(np.uint8)
+        halo = Image.fromarray(halo, "RGB")
+        streamer = _streamer_for_quality(healthy)
+
+        self.assertTrue(streamer._border_guard_needed(halo))
+        self.assertTrue(streamer._border_repair_needed(halo))
+        self.assertGreaterEqual(streamer._border_repair_ratio(halo), 0.13)
 
     def test_progressive_border_crop_preserves_exact_seam_and_repairs_tail(self):
         y, x = np.indices((72, 128))
@@ -191,6 +218,27 @@ class HandoffFrameTests(unittest.TestCase):
         self.assertNotIn("LTXVConcatAVLatent", classes)
         self.assertNotIn("LTXVSeparateAVLatent", classes)
 
+    def test_committed_handoff_snapshot_is_exact_and_atomic(self):
+        array = np.arange(64 * 36 * 3, dtype=np.uint8).reshape((36, 64, 3))
+        frame = Image.fromarray(array, "RGB")
+        streamer = RealtimeVideoStreamer.__new__(RealtimeVideoStreamer)
+        streamer._handoff_snapshot_path = ""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "tail.png")
+            old_value = os.environ.get("LTX25_HANDOFF_SNAPSHOT")
+            os.environ["LTX25_HANDOFF_SNAPSHOT"] = target
+            try:
+                streamer._persist_committed_handoff(frame)
+            finally:
+                if old_value is None:
+                    os.environ.pop("LTX25_HANDOFF_SNAPSHOT", None)
+                else:
+                    os.environ["LTX25_HANDOFF_SNAPSHOT"] = old_value
+
+            restored = Image.open(target).convert("RGB")
+            self.assertEqual(frame.tobytes(), restored.tobytes())
+            self.assertFalse(os.path.exists(target + ".tmp.png"))
+
 
 class RTMPBatchTimingTests(unittest.TestCase):
     def test_temporal_resampling_spreads_duplicates_across_clip(self):
@@ -241,6 +289,100 @@ class TextOverlayTests(unittest.TestCase):
 
 
 class RecoveryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unfinished_viewer_command_stays_active_with_looser_i2v_guide(self):
+        rng = np.random.default_rng(5090)
+        healthy_array = rng.integers(45, 205, size=(36, 64, 3), dtype=np.uint8)
+        healthy = Image.fromarray(healthy_array, "RGB")
+        frames = [healthy.copy()]
+        frames.extend(
+            Image.fromarray(np.roll(healthy_array, index, axis=1), "RGB")
+            for index in range(1, 9)
+        )
+        comment = TwitchComment(
+            username="daaab",
+            message="鏡頭拉遠 這個生物戴上眼鏡",
+            timestamp=1.0,
+        )
+
+        class Generator:
+            def __init__(self):
+                self.requests = []
+
+            def generate_video_from_image(self, request):
+                self.requests.append(request)
+                return LTXVideoResponseWithFrames(
+                    frames=[frame.copy() for frame in frames]
+                )
+
+        class RTMP:
+            def add_frame_batch(self, batch, playback_seconds=None):
+                return len(batch)
+
+        class Overlay:
+            def set_prompt(self, _prompt):
+                pass
+
+            def set_comment(self, _message, _username):
+                pass
+
+            def apply_overlay_batch(self, batch):
+                return batch
+
+            def get_status(self):
+                return {"last_overlay_verified": True, "last_visible_frames": 8}
+
+        class PromptGenerator:
+            @staticmethod
+            def verify_comment_adherence(_comment, _before, _frames):
+                return {
+                    "satisfied": False,
+                    "progressing": True,
+                    "missing": ["生物尚未戴上眼鏡"],
+                    "summary": "眼鏡只出現在附近",
+                }
+
+        generator = Generator()
+        streamer = RealtimeVideoStreamer(
+            twitch_listener=SimpleNamespace(get_recent_comments=lambda _count: []),
+            prompt_generator=PromptGenerator(),
+            realtime_generator=generator,
+            rtmp_streamer=RTMP(),
+            text_overlay=Overlay(),
+            initial_prompt="old story",
+        )
+        streamer.state = StreamingState(
+            is_running=True,
+            current_prompt="old story",
+            previous_prompts=["old story"],
+        )
+        streamer.ltx_config = streamer.ltx_config.copy(update={
+            "model_type": "ltx25-comfy",
+            "width": 64,
+            "height": 36,
+            "num_frames": 9,
+            "frame_rate": 9.0,
+        })
+        streamer._ltx25_continuity_prefix = ""
+        streamer.state.current_frame_base64 = streamer._frame_to_base64(healthy)
+        streamer._quality_reference = streamer._frame_quality(healthy)
+        streamer._retry_prompt_result = PromptResult(
+            selected_comment=comment,
+            prompt=(
+                'Viewer director command -- execute every clause literally and finish '
+                'the visible result in this clip: "鏡頭拉遠 這個生物戴上眼鏡".'
+            ),
+            reasoning="test",
+        )
+
+        await streamer._generate_next_video(use_initial_prompt=False)
+
+        self.assertEqual(0.65, generator.requests[0].strength)
+        self.assertEqual(1.0, generator.requests[0].guidance_scale)
+        self.assertEqual(1, streamer.state.generation_count)
+        self.assertEqual(1, streamer._comment_adherence_retries)
+        self.assertEqual(comment, streamer._retry_prompt_result.selected_comment)
+        self.assertIn("生物尚未戴上眼鏡", streamer._retry_prompt_result.prompt)
+
     async def test_two_poisoned_clips_commit_local_recovery_and_reuse_prompt(self):
         y, x = np.indices((36, 64))
         healthy_array = np.dstack([
