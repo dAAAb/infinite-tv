@@ -186,6 +186,27 @@ CRITICAL: Respond with VALID JSON ONLY.
 JSON Format:
 {{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "all requested actions completed visibly, or a genuinely new story beat", "reasoning": "how this advances the story rhythm"}}"""
 
+COMMENT_COMPILER_PROMPT = """\
+You compile exactly one Twitch viewer command into a literal English prompt for
+an image-to-video model. The current frame may be attached only so you can name
+the visible subject and preserve spatial continuity.
+
+Rules:
+1. The quoted CURRENT VIEWER COMMAND is authoritative. Translate and execute
+   every clause, and do not import an action from story history or an older chat.
+2. Describe the requested action itself, followed by its unmistakable visible
+   end state. Do not replace it with a reaction, intention, discovery, or partial
+   transformation.
+3. Add no unrelated camera move, accessory, character, or transformation.
+4. If the command introduces something absent from the current frame, show it
+   entering naturally from outside the frame; do not silently substitute an
+   existing creature.
+5. Output concise, concrete English suitable for a video model, under 70 words.
+
+Return VALID JSON ONLY:
+{"visual_description":"what is currently visible", "selected_comment":"copy the command exactly", "prompt":"literal English video action and completed end state", "reasoning":"brief mapping of every command clause"}
+"""
+
 STYLE_PRESETS = {
     "cohesive": {
         "prompt": PROMPT_COHESIVE,
@@ -417,8 +438,10 @@ class PromptGenerator(Monitorable):
         """
         message = (comment.message or "").strip()
         return (
-            f'Viewer director command -- execute every clause literally and finish '
-            f'the visible result in this clip: "{message}". {prompt.strip()}'
+            "PRIMARY VIEWER-DIRECTED ACTION: "
+            f"{prompt.strip()} Complete the requested result visibly before the final frame. "
+            f'Original viewer command (authoritative, verbatim): "{message}". '
+            "Do not substitute, weaken, or continue an older viewer command."
         )
 
     def _rewrite_repetitive_prompt(self, client, model: str, formatted_prompt: str,
@@ -482,7 +505,11 @@ class PromptGenerator(Monitorable):
             return {"satisfied": False, "progressing": False, "missing": [comment.message]}
 
         client = self.openai_client
-        model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+        # Comment acceptance is a control-plane decision: a false positive puts
+        # an ignored command on air, while a false negative can stall retries.
+        # gpt-4o-mini misclassified an obvious fish -> cat A/B sample, whereas
+        # gpt-4o correctly compared the same BEFORE/MIDDLE/END frames.
+        model = os.getenv("OPENAI_COMMENT_AUDIT_MODEL", "gpt-4o")
         if client is None and self.local_client is not None and self.local_vision_model:
             client = self.local_client
             model = self.local_vision_model
@@ -497,10 +524,14 @@ class PromptGenerator(Monitorable):
             "type": "text",
             "text": (
                 f'Viewer command: "{comment.message}"\n'
-                "The images are chronological: BEFORE, MIDDLE, END. Check every "
-                "clause literally. Camera movement must be visible across the sequence; "
-                "an accessory must be worn, not merely nearby; a requested transformation "
-                "must reach the requested final identity, not merely begin."
+                "The images are chronological: BEFORE, MIDDLE, END. First extract the "
+                "literal requirements from only the quoted command, then evaluate each of "
+                "those requirements against the images. Do not evaluate or mention any "
+                "action, object, camera behavior, or end state absent from that command. "
+                "A partial attempt is not a completed result. When and only when the command "
+                "requests a transformation, consider it completed if BEFORE clearly has the "
+                "source identity and END unmistakably has the requested target identity; the "
+                "stylized transition does not need to be anatomically literal."
             ),
         }]
         labelled_frames = [("BEFORE", before_frame)] + [
@@ -511,7 +542,7 @@ class PromptGenerator(Monitorable):
             content.append({"type": "text", "text": label})
             content.append({
                 "type": "image_url",
-                "image_url": {"url": self._frame_data_uri(frame), "detail": "low"},
+                "image_url": {"url": self._frame_data_uri(frame), "detail": "high"},
             })
 
         try:
@@ -585,6 +616,12 @@ class PromptGenerator(Monitorable):
         template_keys = set(re.findall(r'\{(\w+)\}', self.system_prompt))
         filtered_vars = {k: v for k, v in template_vars.items() if k in template_keys}
         formatted_prompt = self.system_prompt.format(**filtered_vars)
+        if comments:
+            # Story history is deliberately excluded from command compilation. A
+            # failed older command must not cause the compiler to change the
+            # meaning of the current FIFO chat item (for example, turning
+            # "fish becomes cat" into "a cat jumps into the tank").
+            formatted_prompt = COMMENT_COMPILER_PROMPT
         
         # Select model and client
         model, client = self._select_model_and_client(context)
@@ -608,7 +645,13 @@ class PromptGenerator(Monitorable):
                     "content": [
                         {
                             "type": "text",
-                            "text": "First, briefly describe what you can see in this current frame. Then generate the next video prompt following the system instructions."
+                            "text": (
+                                f'CURRENT VIEWER COMMAND: "{comments[0].message}"\n'
+                                "Compile only this command into the literal English video action."
+                                if comments else
+                                "First, briefly describe what you can see in this current frame. "
+                                "Then generate the next video prompt following the system instructions."
+                            )
                         },
                         {
                             "type": "image_url",
@@ -630,6 +673,11 @@ class PromptGenerator(Monitorable):
                     model = "llama-3.1-70b-versatile"
                 else:
                     model = "gpt-4o-mini"
+        elif comments:
+            messages.append({
+                "role": "user",
+                "content": f'CURRENT VIEWER COMMAND: "{comments[0].message}"',
+            })
         
         # Track input size and start timing
         input_text = formatted_prompt + comment_text
@@ -656,7 +704,14 @@ class PromptGenerator(Monitorable):
                 if is_rate_limit and self.VISUAL_MODE and len(messages) > 1:
                     print(f"⚠️ Rate limit hit, retrying text-only without image...")
                     text_only_messages = [m for m in messages if m.get("role") == "system"]
-                    text_only_messages.append({"role": "user", "content": comment_text or "Generate the next video prompt following the system instructions."})
+                    text_only_messages.append({
+                        "role": "user",
+                        "content": (
+                            f'CURRENT VIEWER COMMAND: "{comments[0].message}"'
+                            if comments else
+                            "Generate the next video prompt following the system instructions."
+                        ),
+                    })
                     if client == self.fal_openrouter_client:
                         text_only_model = self.fal_text_model
                     elif client == self.groq_client:

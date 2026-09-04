@@ -65,6 +65,12 @@ $env:LTX25_RECOVERY_INSET_RATIO = "0.18"
 # Bound interaction latency so Twitch comments reach viewers within roughly one
 # buffered clip instead of sitting behind several minutes of generated frames.
 $env:RTMP_TARGET_QUEUE_SECONDS = "18"
+# Viewer commands use bounded pre-stream retries. Ordinary story clips stay
+# I2V; the third failed command attempt uses local prompt-first LTX with an
+# exact-frame transition. gpt-4o is used only for low-frequency acceptance QA.
+$env:COMMENT_I2V_STRENGTH_SCHEDULE = "0.30,0.10,0.0"
+$env:COMMENT_MAX_ADHERENCE_ATTEMPTS = "3"
+$env:OPENAI_COMMENT_AUDIT_MODEL = "gpt-4o"
 # torch 2.9 Windows: disable inductor static CUDA launcher so torch.compile
 # (reduce-overhead) doesn't hit OverflowError. Required for LTX23_TORCH_COMPILE=true.
 $env:TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER = "0"

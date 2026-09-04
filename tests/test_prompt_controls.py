@@ -19,14 +19,15 @@ class PromptControlTests(unittest.TestCase):
         )
 
         self.assertIn(comment.message, prompt)
-        self.assertIn("execute every clause literally", prompt)
-        self.assertIn("finish the visible result", prompt)
+        self.assertIn("PRIMARY VIEWER-DIRECTED ACTION", prompt)
+        self.assertIn("Complete the requested result visibly", prompt)
+        self.assertLess(prompt.index("The creature notices"), prompt.index(comment.message))
 
     def test_comment_mode_loosens_image_guide_without_fake_cfg(self):
         params = UserCommentParams()
 
         self.assertEqual(1.0, params.guidance_scale)
-        self.assertLess(params.strength, 0.8)
+        self.assertEqual(0.30, params.strength)
 
     def test_repeated_story_beat_is_detected(self):
         candidate = "The cub lunges again, splashing water as it reaches for the shadow."

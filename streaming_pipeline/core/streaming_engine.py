@@ -91,6 +91,8 @@ class RealtimeVideoStreamer(Monitorable):
         self._comment_adherence_attempts: int = 0
         self._comment_adherence_retries: int = 0
         self._comment_adherence_failures: int = 0
+        self._comment_adherence_successes: int = 0
+        self._comment_preflight_rejections: int = 0
         self._last_comment_adherence: Dict[str, Any] = {}
         
         # Track generation parameters history (for metrics)
@@ -679,6 +681,8 @@ class RealtimeVideoStreamer(Monitorable):
         self._comment_adherence_attempts = 0
         self._comment_adherence_retries = 0
         self._comment_adherence_failures = 0
+        self._comment_adherence_successes = 0
+        self._comment_preflight_rejections = 0
         self._last_comment_adherence = {}
         generation_log.info(
             "🧭 Quality reference: "
@@ -832,6 +836,51 @@ class RealtimeVideoStreamer(Monitorable):
             waited = time.time() - wait_started
             self._queue_backpressure_seconds += waited
             generation_log.info(f"▶️ RTMP queue caught up after {waited:.1f}s")
+
+    @staticmethod
+    def _comment_key(comment) -> str:
+        return f"{comment.username}\n{comment.message}" if comment else ""
+
+    def _comment_attempt_number(self, comment) -> int:
+        key = self._comment_key(comment)
+        if key and key == self._active_comment_key:
+            return self._comment_adherence_attempts + 1
+        return 1
+
+    @staticmethod
+    def _comment_strength_for_attempt(attempt: int) -> float:
+        """Progressively release the first-frame guide for literal commands.
+
+        LTXVAddGuide strength controls both guide noise and reference attention.
+        A radical instruction such as fish -> cat cannot succeed while repeatedly
+        anchoring the fish identity at 0.65. The final 0.0 schedule entry is paired
+        with the local prompt-first fallback below; frame zero is restored and the
+        transition is eased before anything can reach RTMP.
+        """
+        raw = os.getenv("COMMENT_I2V_STRENGTH_SCHEDULE", "0.30,0.10,0.0")
+        try:
+            values = [min(1.0, max(0.0, float(item.strip()))) for item in raw.split(",")]
+            values = [value for value in values if value >= 0.0]
+        except ValueError:
+            values = []
+        if not values:
+            values = [0.30, 0.10, 0.0]
+        return values[min(max(1, attempt) - 1, len(values) - 1)]
+
+    @staticmethod
+    def _soften_prompt_first_seam(frames, handoff_frame, transition_frames: int = 8):
+        """Keep frame zero exact and ease into a prompt-dominant final retry."""
+        if not frames:
+            return frames
+        source = handoff_frame.convert("RGB").resize(frames[0].size, Image.Resampling.LANCZOS)
+        softened = list(frames)
+        softened[0] = source.copy()
+        count = min(max(1, transition_frames), len(softened) - 1)
+        for index in range(1, count + 1):
+            t = index / count
+            smooth = t * t * (3.0 - 2.0 * t)
+            softened[index] = Image.blend(source, softened[index].convert("RGB"), smooth)
+        return softened
     
     async def _prepare_next_prompt(self):
         """Generate the next prompt while current video is generating - WITH VISUAL CONTEXT"""
@@ -874,6 +923,8 @@ class RealtimeVideoStreamer(Monitorable):
         cycle_start_time = time.time()
         prompt_result = None
         comment_adherence = None
+        comment_attempt_number = 0
+        comment_strength = None
 
         # Track whether a user comment was used for dynamic parameter adjustment
         used_comment = False
@@ -995,11 +1046,29 @@ class RealtimeVideoStreamer(Monitorable):
 
             if used_comment:
                 comment_params = UserCommentParams()
+                comment_attempt_number = self._comment_attempt_number(selected_comment)
+                comment_strength = self._comment_strength_for_attempt(comment_attempt_number)
                 request_dict.update({
                     "guidance_scale": comment_params.guidance_scale,
-                    "strength": comment_params.strength
+                    "strength": comment_strength,
                 })
-                print(f"🎯 Using COMMENT mode: guidance={comment_params.guidance_scale}, strength={comment_params.strength}")
+                if comment_attempt_number >= 3:
+                    # Local A/B testing showed that LTXVAddGuide can preserve the
+                    # old subject even at strength=0. The bounded final attempt
+                    # therefore removes only the image guide (still on local LTX),
+                    # then eases its output from the exact streamed handoff.
+                    request_dict["force_t2v"] = True
+                    prefix = self._ltx25_continuity_prefix
+                    if prefix and request_dict["prompt"].startswith(prefix):
+                        request_dict["prompt"] = request_dict["prompt"][len(prefix):]
+                request_dict["negative_prompt"] = (
+                    f"{request_dict.get('negative_prompt', '')}, unchanged subject, "
+                    "ignored action, incomplete transformation"
+                ).strip(", ")
+                print(
+                    f"🎯 Using COMMENT mode: attempt={comment_attempt_number}, "
+                    f"guidance={comment_params.guidance_scale}, strength={comment_strength}"
+                )
             elif prompt_result is not None and getattr(prompt_result, "forced_novelty", False):
                 novelty_strength = float(os.getenv("LTX25_NOVELTY_STRENGTH", "0.78"))
                 request_dict["strength"] = min(
@@ -1034,7 +1103,8 @@ class RealtimeVideoStreamer(Monitorable):
                 "num_frames": request.num_frames,
                 "strength": request.strength,
                 "guidance_scale": request.guidance_scale,
-                "timesteps": request.timesteps
+                "timesteps": request.timesteps,
+                "force_t2v": request.force_t2v,
             }
             self.generation_params_history.append(generation_params)
             self.generation_params_history = self.generation_params_history[-10:]
@@ -1053,6 +1123,16 @@ class RealtimeVideoStreamer(Monitorable):
                 )
             generation_duration = time.time() - generation_start_time
             cycle_duration = time.time() - cycle_start_time
+
+            if used_comment and request.force_t2v and video_result.frames:
+                video_result.frames = self._soften_prompt_first_seam(
+                    video_result.frames,
+                    self._base64_to_frame(frame_for_this_gen),
+                )
+                generation_log.info(
+                    "🎞️ Local prompt-first final comment attempt: exact streamed frame zero + "
+                    "8-frame smooth release"
+                )
 
             if border_guard_active and video_result.frames:
                 repair_ratio = self._border_repair_ratio(handoff_frame)
@@ -1104,6 +1184,85 @@ class RealtimeVideoStreamer(Monitorable):
                         "🚑 Corrupt retry limit reached; replacing the poisoned clip "
                         "with a seamless LOCAL recovery push-in"
                     )
+            # Viewer clips are audited before they can be captioned, streamed,
+            # committed as the next I2V handoff, or written into story history.
+            # This prevents the UI from claiming an action that never appeared and
+            # stops a failed fish frame from teaching later prompts that a cat exists.
+            if (
+                selected_comment
+                and not clip_is_corrupt
+                and not recovery_segment
+                and video_result.frames
+                and hasattr(self.prompt_generator, "verify_comment_adherence")
+            ):
+                try:
+                    before_frame = self._base64_to_frame(frame_for_this_gen)
+                    comment_adherence = await asyncio.to_thread(
+                        self.prompt_generator.verify_comment_adherence,
+                        selected_comment,
+                        before_frame,
+                        video_result.frames,
+                    )
+                except Exception as exc:
+                    comment_adherence = {
+                        "satisfied": None,
+                        "skipped": True,
+                        "reason": str(exc)[:200],
+                    }
+                    generation_log.warning(f"⚠️ Comment preflight audit skipped: {exc}")
+                self._last_comment_adherence = comment_adherence or {}
+                generation_log.info(
+                    "🎯 COMMENT PREFLIGHT AUDIT: "
+                    f"satisfied={comment_adherence.get('satisfied')} "
+                    f"progressing={comment_adherence.get('progressing')} "
+                    f"missing={comment_adherence.get('missing', [])} "
+                    f"summary={comment_adherence.get('summary', '')}"
+                )
+
+                comment_key = self._comment_key(selected_comment)
+                if comment_key != self._active_comment_key:
+                    self._active_comment_key = comment_key
+                    self._comment_adherence_attempts = 0
+                self._comment_adherence_attempts = comment_attempt_number
+                if comment_adherence.get("satisfied") is not True:
+                    self._comment_preflight_rejections += 1
+                    self._rejected_clips += 1
+                    max_attempts = max(
+                        1,
+                        int(os.getenv("COMMENT_MAX_ADHERENCE_ATTEMPTS", "3")),
+                    )
+                    missing = comment_adherence.get("missing") or [selected_comment.message]
+                    if not isinstance(missing, list):
+                        missing = [str(missing)]
+                    missing_text = "; ".join(str(item) for item in missing)[:400]
+                    if comment_attempt_number < max_attempts:
+                        retry_prompt = (
+                            f"{prompt_result.prompt} PRIOR ATTEMPT WAS NOT SHOWN. "
+                            f"Correct only these missing requirements now: {missing_text}. "
+                            "Make the requested result large, central, and unmistakable."
+                        )
+                        self._retry_prompt_result = type(prompt_result)(
+                            selected_comment=selected_comment,
+                            prompt=retry_prompt,
+                            reasoning="Preflight kept the original viewer command active",
+                        )
+                        self._comment_adherence_retries += 1
+                        generation_log.warning(
+                            f"🛑 Suppressed failed viewer clip before RTMP; retry "
+                            f"{comment_attempt_number + 1}/{max_attempts} will use a weaker "
+                            f"image guide. Missing: {missing_text}"
+                        )
+                    else:
+                        self._comment_adherence_failures += 1
+                        self._active_comment_key = ""
+                        self._comment_adherence_attempts = 0
+                        generation_log.error(
+                            f"❌ Viewer command failed {max_attempts} preflight attempts; "
+                            "no misleading clip or subtitle was streamed, and story state "
+                            "was not advanced"
+                        )
+                    return
+
             clip_committed = False
 
             # Stream frames to external streamer if available - USE BATCH PROCESSING
@@ -1119,6 +1278,14 @@ class RealtimeVideoStreamer(Monitorable):
                         "holding the last healthy frame"
                     )
                 else:
+                    if recovery_segment and selected_comment:
+                        # A geometric liveness rescue is not the requested scene.
+                        # Keep the command cached for the next generated attempt,
+                        # but never burn its caption onto the recovery push-in.
+                        self.text_overlay.set_comment("")
+                        generation_log.info(
+                            "🧹 Suppressed viewer caption on local recovery segment"
+                        )
                     generation_log.info(f"📺 PROCESSING {len(video_result.frames)} frames with overlay...")
 
                     # Apply text overlay to all frames using batch processing
@@ -1136,6 +1303,7 @@ class RealtimeVideoStreamer(Monitorable):
                         )
 
                     generation_log.info(f"📺 SENDING {len(overlaid_frames)} frames to RTMP streamer...")
+                    cycle_duration = time.time() - cycle_start_time
                     processed_count = self.rtmp_streamer.add_frame_batch(
                         overlaid_frames,
                         playback_seconds=cycle_duration,
@@ -1155,44 +1323,6 @@ class RealtimeVideoStreamer(Monitorable):
                 generation_log.error("❌ NO FRAMES IN VIDEO RESULT!")
             else:
                 generation_log.error("❌ Unknown frame streaming issue")
-
-            # Rendering the subtitle proves only that the command was displayed.
-            # Audit the actual generated sequence before deciding whether the
-            # viewer intent may leave the active-control state.
-            if (
-                clip_committed
-                and selected_comment
-                and not recovery_segment
-                and hasattr(self.prompt_generator, "verify_comment_adherence")
-            ):
-                try:
-                    before_frame = self._base64_to_frame(frame_for_this_gen)
-                    comment_adherence = await asyncio.to_thread(
-                        self.prompt_generator.verify_comment_adherence,
-                        selected_comment,
-                        before_frame,
-                        video_result.frames,
-                    )
-                except Exception as exc:
-                    # The frames are already accepted by RTMP. A transient QA
-                    # failure must not prevent their tail from becoming the next
-                    # I2V handoff, otherwise stream and generation state diverge.
-                    comment_adherence = {
-                        "satisfied": None,
-                        "skipped": True,
-                        "reason": str(exc)[:200],
-                    }
-                    generation_log.warning(
-                        f"⚠️ Comment visual audit skipped without breaking handoff: {exc}"
-                    )
-                self._last_comment_adherence = comment_adherence or {}
-                generation_log.info(
-                    "🎯 COMMENT VISUAL AUDIT: "
-                    f"satisfied={comment_adherence.get('satisfied')} "
-                    f"progressing={comment_adherence.get('progressing')} "
-                    f"missing={comment_adherence.get('missing', [])} "
-                    f"summary={comment_adherence.get('summary', '')}"
-                )
 
             # Transaction boundary: a rejected/unaccepted clip must not change either
             # the I2V handoff frame or the story history.
@@ -1232,44 +1362,10 @@ class RealtimeVideoStreamer(Monitorable):
                 self.state.previous_prompts.append(prompt_to_use)
 
             if selected_comment and comment_adherence is not None:
-                comment_key = f"{selected_comment.username}\n{selected_comment.message}"
-                if comment_key != self._active_comment_key:
-                    self._active_comment_key = comment_key
-                    self._comment_adherence_attempts = 0
-                self._comment_adherence_attempts += 1
-                satisfied = comment_adherence.get("satisfied")
-                max_attempts = max(1, int(os.getenv("COMMENT_MAX_ADHERENCE_ATTEMPTS", "3")))
-                if satisfied is False and self._comment_adherence_attempts < max_attempts:
-                    missing = comment_adherence.get("missing") or [selected_comment.message]
-                    if not isinstance(missing, list):
-                        missing = [str(missing)]
-                    missing_text = "; ".join(str(item) for item in missing)[:400]
-                    retry_prompt = (
-                        f'The viewer command is still active and must be completed now: '
-                        f'"{selected_comment.message}". The prior clip left these clauses '
-                        f'unfinished: {missing_text}. Make the completed result large, '
-                        "central, and unmistakably visible while continuing from frame zero."
-                    )
-                    self._retry_prompt_result = type(prompt_result)(
-                        selected_comment=selected_comment,
-                        prompt=retry_prompt,
-                        reasoning="Vision audit kept the original viewer command active",
-                    )
-                    self._comment_adherence_retries += 1
-                    generation_log.warning(
-                        f"🔁 Viewer command remains active for attempt "
-                        f"{self._comment_adherence_attempts + 1}/{max_attempts}: "
-                        f"{missing_text}"
-                    )
-                else:
-                    if satisfied is False:
-                        self._comment_adherence_failures += 1
-                        generation_log.warning(
-                            f"⚠️ Viewer command audit still incomplete after {max_attempts} clips; "
-                            "releasing it to avoid deadlocking the story"
-                        )
-                    self._active_comment_key = ""
-                    self._comment_adherence_attempts = 0
+                if comment_adherence.get("satisfied") is True:
+                    self._comment_adherence_successes += 1
+                self._active_comment_key = ""
+                self._comment_adherence_attempts = 0
             generation_log.info(
                 f"🔗 Committed streamed tail as next I2V first frame: "
                 f"{self._committed_handoff_sha256[:12]}"
@@ -1308,6 +1404,8 @@ class RealtimeVideoStreamer(Monitorable):
             "comment_adherence_attempts": self._comment_adherence_attempts,
             "comment_adherence_retries": self._comment_adherence_retries,
             "comment_adherence_failures": self._comment_adherence_failures,
+            "comment_adherence_successes": self._comment_adherence_successes,
+            "comment_preflight_rejections": self._comment_preflight_rejections,
             "last_comment_adherence": self._last_comment_adherence,
             "queue_backpressure_waits": self._queue_backpressure_waits,
             "queue_backpressure_seconds": round(self._queue_backpressure_seconds, 1),

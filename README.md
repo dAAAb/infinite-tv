@@ -2,7 +2,7 @@
 
 > A local-first fork of [alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv): Twitch chat drives an evolving story, ComfyUI + LTX 2.5 generates the next clip on a local RTX 5090, and FFmpeg keeps the stream alive.
 
-**目前穩定版已把影片生成移到單張 RTX 5090 本機執行。** 第二段開始，每段都使用上一段「實際送進串流」的最後一格做 Image-to-Video；劇情、留言字幕和 RTMP queue 也一起做了連續性與存活性保護。已知限制是段落交界仍偶爾有輕微動作跳動，這是下一輪優化重點。
+**目前穩定版已把影片生成移到單張 RTX 5090 本機執行。** 第二段開始，一般段落都使用上一段「實際送進串流」的最後一格做 Image-to-Video；只有 viewer command 連續兩次未通過視覺驗收時，才會在第三次以同一套本機 LTX 做 prompt-first fallback，再從 exact handoff 平滑銜接。劇情、留言字幕和 RTMP queue 也一起做了連續性與存活性保護。已知限制是段落交界仍偶爾有輕微動作跳動，這是下一輪優化重點。
 
 ## The important correction: local vs. fal.ai
 
@@ -38,7 +38,7 @@ Merely having a `FAL_KEY` is no longer permission to spend money.
 - Border/corruption guard for hard bars and soft chromatic/vignette halos, with adaptive full-bleed repair.
 - Local recovery segment after repeated bad generations, so the channel never deadlocks on one frame.
 - RTMP backpressure capped around one clip instead of accumulating minutes of latency.
-- Twitch comments are consumed FIFO one per clip, retained verbatim in the video prompt, rendered on stream copies only, and vision-audited for visible completion.
+- Twitch comments are consumed FIFO one per clip, compiled into a literal English action while retaining the verbatim original, and vision-audited **before** captioning or RTMP commit.
 - Anti-stall prompt checks catch both near-duplicate prose and recurring action/object loops, then force a concrete scene-changing beat with a looser image guide; a three-clip cooldown preserves narrative pacing.
 - Windows named-pipe audio/BGM support and orphaned-FFmpeg cleanup.
 
@@ -113,7 +113,7 @@ A Twitch comment can be correctly received, selected and burned into frames yet 
 
 ### 6. A displayed comment is not necessarily an executed command
 
-The old prompt stage could select `鏡頭拉遠 這個生物戴上眼鏡` but silently turn it into “the creature notices glasses,” dropping both the camera move and the completed action. Comments are now authoritative FIFO commands: the original text is retained verbatim, every clause must be completed, and comment clips use a 0.65 image-guide strength because the distilled Comfy graph is fixed at CFG 1.0. A before/middle/end vision audit keeps an unfinished command active for up to three clips while later comments remain queued.
+The old prompt stage could select `鏡頭拉遠 這個生物戴上眼鏡` but silently turn it into “the creature notices glasses,” dropping both the camera move and the completed action. Comments are now authoritative FIFO commands. A dedicated compiler translates only the current comment into a literal English video action while retaining the original text verbatim. A stricter before/middle/end audit runs before RTMP: failed clips receive no caption, never reach viewers, never become the next handoff, and never enter story history. Retries progressively release the image guide (`0.30 → 0.10`); if the old subject is still locked, a third local prompt-first LTX attempt is eased from the exact streamed frame over eight frames. Only a visually verified clip is captioned and committed. Ordinary story clips remain I2V.
 
 ### 7. Soft coloured halos are different from black bars
 
@@ -175,6 +175,7 @@ Edit `.env` locally:
 
 ```dotenv
 OPENAI_API_KEY=your_openai_key
+OPENAI_COMMENT_AUDIT_MODEL=gpt-4o
 TWITCH_CHANNEL=your_channel
 TWITCH_STREAM_KEY=your_stream_key
 
@@ -183,6 +184,7 @@ COMFYUI_DIR=C:\path\to\ComfyUI
 
 USE_FAL_OPENROUTER=false
 ENABLE_FAL_VIDEO=false
+COMMENT_I2V_STRENGTH_SCHEDULE=0.30,0.10,0.0
 ```
 
 `.env`, logs, model weights, output frames, virtual environments and generated media are gitignored. Never paste keys into scripts, prompts, screenshots or Git remote URLs.
@@ -274,7 +276,7 @@ Then explicitly select `ltx-2.3` or `h3-max`. Pricing and availability change; c
 4. **Autoregressive video needs maintenance.** Borders, posterization and saturation errors compound when every tail becomes the next input.
 5. **A live system needs a bounded failure mode.** Quality gates must recover instead of deadlocking.
 6. **Continuity has layers.** Exact pixels, continuous motion, narrative state and interaction latency are separate problems.
-7. **Displaying intent is not satisfying intent.** Viewer control needs a post-generation visual audit and bounded retries, not only an LLM prompt and subtitle.
+7. **Displaying intent is not satisfying intent.** Viewer control needs a pre-stream visual audit and bounded retries; failed commands must not be captioned, committed, or written into story history.
 8. **Redact operational URLs.** A Twitch RTMP URL contains the stream key in its path; logs record only a redacted marker.
 
 ## Project structure

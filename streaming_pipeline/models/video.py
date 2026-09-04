@@ -29,6 +29,10 @@ class LTXVideoRequestI2V(BaseModel):
     spatio_temporal_guidance_blocks: Optional[List[int]] = Field(default=None, description="Transformer block indices at which to apply STG (required when stg_scale>0)")
     noise_scale: float = Field(default=0.15, description="Noise injected into latents during denoising; breaks deterministic loops (0-0.3)")
     seed: Optional[int] = Field(default=None, description="Generation seed. If null, a random seed is used per generation")
+    force_t2v: bool = Field(
+        default=False,
+        description="Use local prompt-first generation for a bounded viewer-command fallback",
+    )
 
     # LTX 2.3 Condition pipeline: character reference images
     # Each entry: {"image": "base64_or_url", "strength": 0.4, "label": "Homer Simpson"}

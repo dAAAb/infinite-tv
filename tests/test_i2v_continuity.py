@@ -289,7 +289,7 @@ class TextOverlayTests(unittest.TestCase):
 
 
 class RecoveryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unfinished_viewer_command_stays_active_with_looser_i2v_guide(self):
+    async def test_failed_viewer_clip_is_suppressed_then_retried_with_weaker_guide(self):
         rng = np.random.default_rng(5090)
         healthy_array = rng.integers(45, 205, size=(36, 64, 3), dtype=np.uint8)
         healthy = Image.fromarray(healthy_array, "RGB")
@@ -315,7 +315,11 @@ class RecoveryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         class RTMP:
+            def __init__(self):
+                self.batches = []
+
             def add_frame_batch(self, batch, playback_seconds=None):
+                self.batches.append(batch)
                 return len(batch)
 
         class Overlay:
@@ -332,21 +336,32 @@ class RecoveryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 return {"last_overlay_verified": True, "last_visible_frames": 8}
 
         class PromptGenerator:
-            @staticmethod
-            def verify_comment_adherence(_comment, _before, _frames):
+            def __init__(self):
+                self.calls = 0
+
+            def verify_comment_adherence(self, _comment, _before, _frames):
+                self.calls += 1
+                if self.calls < 3:
+                    return {
+                        "satisfied": False,
+                        "progressing": True,
+                        "missing": ["生物尚未戴上眼鏡"],
+                        "summary": "眼鏡只出現在附近",
+                    }
                 return {
-                    "satisfied": False,
-                    "progressing": True,
-                    "missing": ["生物尚未戴上眼鏡"],
-                    "summary": "眼鏡只出現在附近",
+                    "satisfied": True,
+                    "progressing": False,
+                    "missing": [],
+                    "summary": "生物已戴上眼鏡",
                 }
 
         generator = Generator()
+        rtmp = RTMP()
         streamer = RealtimeVideoStreamer(
             twitch_listener=SimpleNamespace(get_recent_comments=lambda _count: []),
             prompt_generator=PromptGenerator(),
             realtime_generator=generator,
-            rtmp_streamer=RTMP(),
+            rtmp_streamer=rtmp,
             text_overlay=Overlay(),
             initial_prompt="old story",
         )
@@ -376,12 +391,33 @@ class RecoveryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         await streamer._generate_next_video(use_initial_prompt=False)
 
-        self.assertEqual(0.65, generator.requests[0].strength)
+        self.assertEqual(0.30, generator.requests[0].strength)
         self.assertEqual(1.0, generator.requests[0].guidance_scale)
-        self.assertEqual(1, streamer.state.generation_count)
+        self.assertEqual(0, streamer.state.generation_count)
+        self.assertEqual([], rtmp.batches)
         self.assertEqual(1, streamer._comment_adherence_retries)
         self.assertEqual(comment, streamer._retry_prompt_result.selected_comment)
         self.assertIn("生物尚未戴上眼鏡", streamer._retry_prompt_result.prompt)
+        self.assertEqual(["old story"], streamer.state.previous_prompts)
+
+        await streamer._generate_next_video(use_initial_prompt=False)
+
+        self.assertEqual(0.10, generator.requests[1].strength)
+        self.assertFalse(generator.requests[1].force_t2v)
+        self.assertEqual(0, streamer.state.generation_count)
+        self.assertEqual([], rtmp.batches)
+
+        await streamer._generate_next_video(use_initial_prompt=False)
+
+        self.assertEqual(0.0, generator.requests[2].strength)
+        self.assertTrue(generator.requests[2].force_t2v)
+        self.assertEqual(1, streamer.state.generation_count)
+        self.assertEqual(1, len(rtmp.batches))
+        self.assertEqual(healthy.tobytes(), rtmp.batches[0][0].tobytes())
+        self.assertEqual(1, streamer._comment_adherence_successes)
+        self.assertEqual(2, streamer._comment_preflight_rejections)
+        self.assertEqual(2, streamer._comment_adherence_retries)
+        self.assertIn("PRIOR ATTEMPT WAS NOT SHOWN", streamer.state.current_prompt)
 
     async def test_two_poisoned_clips_commit_local_recovery_and_reuse_prompt(self):
         y, x = np.indices((36, 64))

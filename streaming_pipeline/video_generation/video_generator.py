@@ -484,14 +484,14 @@ class RealtimeGenerator(Monitorable):
     def generate_video_with_comfy_ltx25(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate via the local ComfyUI LTX-2.5 NVFP4 server.
 
-        Every clip with an input frame uses I2V. The caller transactionally advances
-        that input only after the previous clip passed validation and was accepted by
-        the streamer, so silently falling back to T2V would break continuity.
+        Normal clips with an input frame use I2V. The only prompt-first exception is
+        an explicit, bounded viewer-command fallback after I2V attempts fail visual
+        QA; its caller restores exact frame zero and eases the opening transition.
         """
         import time
 
         from streaming_pipeline.video_generation import comfy_ltx25_backend as comfy
-        mode = "i2v" if request.image_base64 else "t2v"
+        mode = "t2v" if request.force_t2v else ("i2v" if request.image_base64 else "t2v")
         print(f"🔗 ltx25-comfy: explicit {mode.upper()} mode")
         start_time = time.monotonic()
         frames, audio_pcm = comfy.generate(

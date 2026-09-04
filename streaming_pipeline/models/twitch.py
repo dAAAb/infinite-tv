@@ -9,7 +9,7 @@ class UserCommentParams(BaseModel):
     # higher CFG values. Prompt adherence is controlled here by weakening the
     # first-frame guide while frame zero is still replaced with the exact handoff.
     guidance_scale: float = Field(default=1.0, description="LTX 2.5 distilled CFG")
-    strength: float = Field(default=0.65, description="Looser image guide for visible viewer-requested changes")
+    strength: float = Field(default=0.30, description="First-attempt image guide for visible viewer-requested changes")
 
 
 @dataclass
