@@ -94,6 +94,7 @@ class RealtimeVideoStreamer(Monitorable):
         self._comment_adherence_successes: int = 0
         self._comment_preflight_rejections: int = 0
         self._last_comment_adherence: Dict[str, Any] = {}
+        self._terminal_blur_trims: int = 0
         
         # Track generation parameters history (for metrics)
         self.generation_params_history = []
@@ -684,6 +685,7 @@ class RealtimeVideoStreamer(Monitorable):
         self._comment_adherence_successes = 0
         self._comment_preflight_rejections = 0
         self._last_comment_adherence = {}
+        self._terminal_blur_trims = 0
         generation_log.info(
             "🧭 Quality reference: "
             f"ext={self._quality_reference['extreme_fraction']:.3f}, "
@@ -849,22 +851,21 @@ class RealtimeVideoStreamer(Monitorable):
 
     @staticmethod
     def _comment_strength_for_attempt(attempt: int) -> float:
-        """Progressively release the first-frame guide for literal commands.
+        """Progressively release the first-frame guide without abandoning the set.
 
         LTXVAddGuide strength controls both guide noise and reference attention.
-        A radical instruction such as fish -> cat cannot succeed while repeatedly
-        anchoring the fish identity at 0.65. The final 0.0 schedule entry is paired
-        with the local prompt-first fallback below; frame zero is restored and the
-        transition is eased before anything can reach RTMP.
+        Start at the official LTX I2V value for scene continuity, loosen once for
+        action compliance, then use a first/last-frame scene bridge rather than
+        removing image conditioning entirely.
         """
-        raw = os.getenv("COMMENT_I2V_STRENGTH_SCHEDULE", "0.30,0.10,0.0")
+        raw = os.getenv("COMMENT_I2V_STRENGTH_SCHEDULE", "0.70,0.45,0.20")
         try:
             values = [min(1.0, max(0.0, float(item.strip()))) for item in raw.split(",")]
             values = [value for value in values if value >= 0.0]
         except ValueError:
             values = []
         if not values:
-            values = [0.30, 0.10, 0.0]
+            values = [0.70, 0.45, 0.20]
         return values[min(max(1, attempt) - 1, len(values) - 1)]
 
     @staticmethod
@@ -881,6 +882,55 @@ class RealtimeVideoStreamer(Monitorable):
             smooth = t * t * (3.0 - 2.0 * t)
             softened[index] = Image.blend(source, softened[index].convert("RGB"), smooth)
         return softened
+
+    @staticmethod
+    def _frame_sharpness(frame: Image.Image) -> float:
+        """Return a cheap edge-energy score; low terminal values indicate motion blur."""
+        import numpy as np
+
+        rgb = np.asarray(frame.convert("RGB").resize((256, 144)), dtype=np.float32)
+        gray = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+        dx = np.diff(gray, axis=1)
+        dy = np.diff(gray, axis=0)
+        return float((dx * dx).mean() + (dy * dy).mean())
+
+    def _stabilize_terminal_blur(self, frames):
+        """End on a recent sharp generated frame instead of chaining motion blur.
+
+        LTX often accelerates motion in its final few decoded frames. Feeding that
+        smeared terminal image into the next I2V call makes a blur pulse recur at
+        every join. Select the latest acceptably sharp frame from the final second,
+        then distribute the retained frames back to the original count without
+        pixel blending. The selected image is still generated and streamed, and it
+        becomes the exact next handoff.
+        """
+        if len(frames) < 9:
+            return frames
+        import numpy as np
+
+        original_count = len(frames)
+        start = max(0, original_count - 9)
+        scores = [self._frame_sharpness(frame) for frame in frames[start:]]
+        reference = float(np.median(scores[:max(1, len(scores) - 3)]))
+        threshold = max(1.0, reference * 0.82)
+        chosen = original_count - 1
+        for offset in range(len(scores) - 1, -1, -1):
+            if scores[offset] >= threshold:
+                chosen = start + offset
+                break
+        if chosen >= original_count - 1:
+            return frames
+
+        retained = frames[:chosen + 1]
+        indices = np.linspace(0, len(retained) - 1, original_count).round().astype(int)
+        stabilized = [retained[index] for index in indices]
+        self._terminal_blur_trims += 1
+        generation_log.info(
+            f"🎯 Terminal blur guard: ended on generated frame {chosen + 1}/"
+            f"{original_count} (sharpness {scores[chosen - start]:.1f} vs "
+            f"{scores[-1]:.1f}); kept {original_count} streamed frames"
+        )
+        return stabilized
     
     async def _prepare_next_prompt(self):
         """Generate the next prompt while current video is generating - WITH VISUAL CONTEXT"""
@@ -1040,6 +1090,31 @@ class RealtimeVideoStreamer(Monitorable):
                 "image_base64": frame_for_this_gen,
             })
 
+            # Scene continuity is a global invariant, not only a comment-retry
+            # concern. The visual planner describes the current set from the real
+            # streamed handoff; keep that set recognizable for ordinary evolution
+            # too. Only an explicit viewer relocation command may release it.
+            scene_description = (
+                getattr(prompt_result, "visual_description", "")
+                if prompt_result is not None
+                else ""
+            )
+            scene_change_requested = bool(
+                selected_comment
+                and getattr(prompt_result, "scene_change_requested", False)
+            )
+            if scene_description and not scene_change_requested:
+                prompt_for_this_gen += (
+                    " SCENE LOCK: keep this same physical location, background layout, "
+                    f"lighting, and camera axis recognizable: {scene_description}. "
+                    "Advance the story through action inside this set; do not replace it."
+                )
+            request_dict.update({
+                "prompt": prompt_for_this_gen,
+                "scene_description": scene_description,
+                "preserve_scene": not scene_change_requested,
+            })
+
             # Pass character references for the condition pipeline
             if self.ltx_config.model_type == "ltx-2.3-condition" and self.state.character_refs:
                 request_dict["character_refs"] = self.state.character_refs
@@ -1053,14 +1128,11 @@ class RealtimeVideoStreamer(Monitorable):
                     "strength": comment_strength,
                 })
                 if comment_attempt_number >= 3:
-                    # Local A/B testing showed that LTXVAddGuide can preserve the
-                    # old subject even at strength=0. The bounded final attempt
-                    # therefore removes only the image guide (still on local LTX),
-                    # then eases its output from the exact streamed handoff.
-                    request_dict["force_t2v"] = True
-                    prefix = self._ltx25_continuity_prefix
-                    if prefix and request_dict["prompt"].startswith(prefix):
-                        request_dict["prompt"] = request_dict["prompt"][len(prefix):]
+                    # A pure T2V fallback obeys radical commands but invents a new
+                    # set. Build a local target, then use the official first/last
+                    # frame conditioning pattern so the real streamed tail remains
+                    # a model keyframe throughout the transition.
+                    request_dict["scene_bridge"] = True
                 request_dict["negative_prompt"] = (
                     f"{request_dict.get('negative_prompt', '')}, unchanged subject, "
                     "ignored action, incomplete transformation"
@@ -1105,6 +1177,8 @@ class RealtimeVideoStreamer(Monitorable):
                 "guidance_scale": request.guidance_scale,
                 "timesteps": request.timesteps,
                 "force_t2v": request.force_t2v,
+                "scene_bridge": request.scene_bridge,
+                "preserve_scene": request.preserve_scene,
             }
             self.generation_params_history.append(generation_params)
             self.generation_params_history = self.generation_params_history[-10:]
@@ -1124,14 +1198,10 @@ class RealtimeVideoStreamer(Monitorable):
             generation_duration = time.time() - generation_start_time
             cycle_duration = time.time() - cycle_start_time
 
-            if used_comment and request.force_t2v and video_result.frames:
-                video_result.frames = self._soften_prompt_first_seam(
-                    video_result.frames,
-                    self._base64_to_frame(frame_for_this_gen),
-                )
+            if used_comment and request.scene_bridge and video_result.frames:
                 generation_log.info(
-                    "🎞️ Local prompt-first final comment attempt: exact streamed frame zero + "
-                    "8-frame smooth release"
+                    "🎞️ Local scene bridge final comment attempt: streamed tail used as "
+                    "a true first-frame guide, with a scene-locked target at the final frame"
                 )
 
             if border_guard_active and video_result.frames:
@@ -1160,6 +1230,9 @@ class RealtimeVideoStreamer(Monitorable):
                     generation_log.info(
                         "🩹 Adaptive repair rescued the generated clip with an exact-seam push-in"
                     )
+
+            if not clip_is_corrupt and video_result.frames:
+                video_result.frames = self._stabilize_terminal_blur(video_result.frames)
 
             if clip_is_corrupt:
                 self._consecutive_corrupt_rejections += 1
@@ -1245,6 +1318,10 @@ class RealtimeVideoStreamer(Monitorable):
                             selected_comment=selected_comment,
                             prompt=retry_prompt,
                             reasoning="Preflight kept the original viewer command active",
+                            visual_description=getattr(prompt_result, "visual_description", ""),
+                            scene_change_requested=bool(
+                                getattr(prompt_result, "scene_change_requested", False)
+                            ),
                         )
                         self._comment_adherence_retries += 1
                         generation_log.warning(
@@ -1407,6 +1484,7 @@ class RealtimeVideoStreamer(Monitorable):
             "comment_adherence_successes": self._comment_adherence_successes,
             "comment_preflight_rejections": self._comment_preflight_rejections,
             "last_comment_adherence": self._last_comment_adherence,
+            "terminal_blur_trims": self._terminal_blur_trims,
             "queue_backpressure_waits": self._queue_backpressure_waits,
             "queue_backpressure_seconds": round(self._queue_backpressure_seconds, 1),
         }

@@ -484,14 +484,20 @@ class RealtimeGenerator(Monitorable):
     def generate_video_with_comfy_ltx25(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate via the local ComfyUI LTX-2.5 NVFP4 server.
 
-        Normal clips with an input frame use I2V. The only prompt-first exception is
-        an explicit, bounded viewer-command fallback after I2V attempts fail visual
-        QA; its caller restores exact frame zero and eases the opening transition.
+        Normal clips with an input frame use I2V. Difficult viewer commands use a
+        bounded scene bridge after I2V attempts fail visual QA: local prompt-first
+        creates only a target keyframe, then LTX first/last-frame conditioning keeps
+        the actual streamed tail as the transition's starting scene.
         """
         import time
 
         from streaming_pipeline.video_generation import comfy_ltx25_backend as comfy
-        mode = "t2v" if request.force_t2v else ("i2v" if request.image_base64 else "t2v")
+        if request.scene_bridge:
+            mode = "scene_bridge"
+        elif request.force_t2v:
+            mode = "t2v"
+        else:
+            mode = "i2v" if request.image_base64 else "t2v"
         print(f"🔗 ltx25-comfy: explicit {mode.upper()} mode")
         start_time = time.monotonic()
         frames, audio_pcm = comfy.generate(
@@ -508,6 +514,8 @@ class RealtimeGenerator(Monitorable):
             # latent, which adds latency and another temporal boundary.
             want_audio=False,
             mode=mode,
+            scene_description=request.scene_description,
+            preserve_scene=request.preserve_scene,
         )
         self.last_generation_time = time.monotonic() - start_time
         self.total_generation_time += self.last_generation_time

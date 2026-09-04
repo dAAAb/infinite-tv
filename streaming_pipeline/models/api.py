@@ -29,15 +29,16 @@ class StartStreamRequest(BaseModel):
     # Defaults are tuned for the continuity-first ComfyUI LTX 2.5 path on RTX 5090:
     #   - height/width chosen to be divisible by 32 (LTX requirement) and small
     #     enough to keep transformer FLOPs low
-    #   - num_frames chosen to be `8*k + 1` (LTX requirement); 121 frames @ 9
-    #     output FPS is ~13s of stream content, comfortably > one gen cycle
+    #   - num_frames chosen to be `8*k + 1` (LTX requirement); 145 frames @ 9
+    #     output FPS is ~16s of stream content, reducing visible joins while still
+    #     staying close to one RTX 5090 generation cycle
     negative_prompt: Optional[str] = Field(
         default="frame, border, vignette, letterbox, pillarbox, black bars, white bars, picture-in-picture, screen-within-screen, oversaturated rainbow edges",
         description="The negative prompt",
     )
     height: Optional[int] = Field(default=288, description="The height of the video (must be divisible by 32)")
     width: Optional[int] = Field(default=512, description="The width of the video (must be divisible by 32)")
-    num_frames: Optional[int] = Field(default=121, description="The number of frames to generate (must be 8*k + 1)")
+    num_frames: Optional[int] = Field(default=145, description="The number of frames to generate (must be 8*k + 1)")
     # If unset, streaming_service auto-fills this from target_fps so audio
     # length matches the RTMP stream's playback duration.
     frame_rate: Optional[float] = Field(default=None, description="Generation frame rate (defaults to target_fps to keep audio in sync with playback)")

@@ -27,6 +27,8 @@ class PromptResult:
     prompt: str
     reasoning: str
     forced_novelty: bool = False
+    visual_description: str = ""
+    scene_change_requested: bool = False
 
 VISUAL_MODE = True
 
@@ -56,12 +58,13 @@ CRITICAL STORYTELLING RULES:
 1. **NEVER REPEAT** - If recent prompts are similar, FORCE dramatic change
 2. **ALWAYS PROGRESS** - Each prompt must ADD something new or CHANGE something significant
 3. **BE BOLD** - Don't just describe what you see, TRANSFORM it
-4. **FIX PROBLEMS** - If scene is messy/boring, use dramatic transitions (explosions, portals, sudden changes)
+4. **FIX PROBLEMS** - If the action is stale, create a decisive event inside the current location
+5. **LOCK THE SET** - Preserve the current location, background layout, lighting, and camera axis unless the viewer explicitly requests moving elsewhere
 
 PROGRESSION TACTICS:
 - Scene getting repetitive? → Add NEW character/object/event
 - Character stuck in one action? → Make them DO something different
-- Same location too long? → Transport to NEW location
+- Same location too long? → Reveal a NEW object, character, consequence, or area already inside it
 - Too much flying/floating? → LAND somewhere interesting
 - Too static? → Add CONFLICT or CHALLENGE
 - Too peaceful? → Create URGENCY or DANGER
@@ -69,12 +72,12 @@ PROGRESSION TACTICS:
 TASK:
 If chat comments are provided:
 1. Pick the most TRANSFORMATIVE comment
-2. Use it to DRASTICALLY change the current scene
-3. Don't worry about perfect continuity - video AI will handle transitions
+2. Use it to change the action while preserving the current set unless the viewer explicitly requests a new location
+3. Maintain physical and visual continuity from the attached frame
 
 If no comments:
 1. Look at last 3 prompts - if similar, do something COMPLETELY DIFFERENT
-2. Introduce NEW: location, character, object, or event
+2. Introduce a NEW character, object, conflict, or event inside the same location
 3. Create CONFLICT, DISCOVERY, or TRANSFORMATION
 4. NEVER just continue the same action
 
@@ -87,7 +90,7 @@ STYLE:
 EXAMPLES OF GOOD PROGRESSION:
 - Astronaut flying → Astronaut CRASHES into alien spaceship
 - Robot walking → Robot TRANSFORMS into vehicle  
-- Character exploring → Character DISCOVERS hidden portal
+- Character exploring → Character DISCOVERS a hidden mechanism in the current setting
 - Scene peaceful → EXPLOSION changes everything
 
 MODE INSTRUCTIONS:
@@ -96,7 +99,7 @@ If mode is "nightmare": Make ALL prompts nightmarish/bizarre/outlandish. Transfo
 CRITICAL: You MUST respond with VALID JSON ONLY.
 
 JSON Format (required):
-{{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "NEW action that CHANGES the story", "reasoning": "why this creates progression"}}"""
+{{"visual_description": "current subjects, location, background layout, lighting, and camera framing", "scene_change_requested": false, "selected_comment": "exact text or null", "prompt": "NEW action in the SAME physical setting unless chat explicitly relocates it", "reasoning": "why this creates progression without replacing the set"}}"""
 
 PROMPT_COHESIVE = """\
 You are the writer and director of an ongoing animated story. The characters
@@ -143,13 +146,15 @@ STORY RHYTHM (based on clip number):
 - Clips 11-15: ESCALATE. Things get more interesting -- the character must
   react to consequences, make a choice, or deal with something unexpected.
 - Clips 16+: RESOLVE and RESET. The situation reaches a peak, then a new
-  situation begins. New cycle starts.
+  conflict or goal begins in the same physical setting.
 
 CONTINUITY RULES:
-1. Same characters, same location (unless transitioning naturally)
+1. Same characters, same physical location, recognizable background layout,
+   lighting, and camera axis. Only an explicit viewer command can relocate them
 2. Each prompt flows from the previous one -- no teleportation
 3. New elements enter NATURALLY (walk in, appear in background, are discovered)
-4. Transitions through doors, corridors, camera movement -- not cuts
+4. Do not invent portals, exits, doors, travel, or off-screen relocation as an
+   anti-repetition shortcut
 
 WHEN CHAT COMMENTS EXIST:
 1. Treat the FIRST comment as an authoritative director command, not a suggestion
@@ -168,7 +173,7 @@ WHEN NO COMMENTS:
 4. Compare against the last five prompts. Never repeat the same subject-action-
    object beat, emotional reaction, or investigate/recoil/approach loop
 5. If the scene has repeated a micro-action twice, introduce a concrete new
-   object, character, consequence, or continuous location transition now
+   object, character, consequence, or event within the current location now
 
 STYLE:
 - Write what the CHARACTER DOES, not what the camera sees
@@ -184,7 +189,7 @@ to notice something is off. Build dread through the character's growing unease.
 
 CRITICAL: Respond with VALID JSON ONLY.
 JSON Format:
-{{"visual_description": "what you see", "selected_comment": "exact text or null", "prompt": "all requested actions completed visibly, or a genuinely new story beat", "reasoning": "how this advances the story rhythm"}}"""
+{{"visual_description": "current subjects, location, background layout, lighting, and camera framing", "scene_change_requested": false, "selected_comment": "exact text or null", "prompt": "all requested actions completed visibly, or a genuinely new story beat in the same setting", "reasoning": "how this advances the story rhythm without replacing the set"}}"""
 
 COMMENT_COMPILER_PROMPT = """\
 You compile exactly one Twitch viewer command into a literal English prompt for
@@ -201,10 +206,14 @@ Rules:
 4. If the command introduces something absent from the current frame, show it
    entering naturally from outside the frame; do not silently substitute an
    existing creature.
-5. Output concise, concrete English suitable for a video model, under 70 words.
+5. Preserve the current location, background layout, lighting, camera axis, and
+   existing characters unless the viewer explicitly asks to move, return, enter,
+   leave, or change location. Changing an object or character is not permission to
+   redesign the room or landscape.
+6. Output concise, concrete English suitable for a video model, under 70 words.
 
 Return VALID JSON ONLY:
-{"visual_description":"what is currently visible", "selected_comment":"copy the command exactly", "prompt":"literal English video action and completed end state", "reasoning":"brief mapping of every command clause"}
+{"visual_description":"current subjects, location, background layout, lighting, and camera framing", "scene_change_requested":false, "selected_comment":"copy the command exactly", "prompt":"literal English video action and completed end state in the same scene", "reasoning":"brief mapping of every command clause"}
 """
 
 STYLE_PRESETS = {
@@ -459,7 +468,8 @@ class PromptGenerator(Monitorable):
                     + "\nReturn JSON with selected_comment=null and a replacement prompt "
                       "that causes one unmistakable, irreversible visual development. "
                       "Do not repeat approaching, staring, hesitating, reaching, splashing, "
-                      "or reacting to the same object. Keep it one continuous shot."
+                      "or reacting to the same object. Keep it one continuous shot in the "
+                      "same physical location and preserve the background layout."
                 ),
             },
         ]
@@ -478,9 +488,9 @@ class PromptGenerator(Monitorable):
             print(f"⚠️ Anti-stall rewrite failed, using local escape beat: {exc}")
 
         escape_beats = (
-            "A new character enters urgently and leads the protagonist away from the repeated action into a different area, in one continuous tracking shot.",
-            "The object activates decisively, transforming the surroundings and forcing the protagonist to make a visible choice.",
-            "A passage opens in the current setting; the protagonist leaves the old spot and enters it without a cut.",
+            "A new character enters urgently and interrupts the repeated action, forcing the protagonist to make a visible choice in the same setting.",
+            "The object activates decisively while the existing surroundings remain intact, forcing the protagonist to make a visible choice.",
+            "A hidden mechanism activates inside the current setting and creates a concrete obstacle without moving the protagonist elsewhere.",
             "The repeated situation resolves abruptly, revealing a concrete new obstacle that the protagonist immediately confronts.",
         )
         return escape_beats[context.generation_count % len(escape_beats)]
@@ -528,6 +538,11 @@ class PromptGenerator(Monitorable):
                 "literal requirements from only the quoted command, then evaluate each of "
                 "those requirements against the images. Do not evaluate or mention any "
                 "action, object, camera behavior, or end state absent from that command. "
+                "Also decide whether the command explicitly requests a different location. "
+                "If it does not, the same setting/background and camera axis must remain "
+                "recognizably continuous; an unrelated replacement scene is a failure even "
+                "when the requested subject or action appears. Camera motion within the same "
+                "location is not a location change. "
                 "A partial attempt is not a completed result. When and only when the command "
                 "requests a transformation, consider it completed if BEFORE clearly has the "
                 "source identity and END unmistakably has the requested target identity; the "
@@ -555,8 +570,10 @@ class PromptGenerator(Monitorable):
                             "You are a strict visual QA auditor for a continuous generated video. "
                             "Return JSON only: satisfied is true only when every viewer-command "
                             "clause is visibly completed; progressing is true for meaningful but "
-                            "unfinished progress; missing lists concise unfinished clauses; summary "
-                            "briefly states the evidence."
+                            "unfinished progress; scene_change_requested is true only when the quoted "
+                            "command explicitly moves to another place; scene_preserved is true when "
+                            "the original setting remains recognizable from BEFORE through END; "
+                            "missing lists concise unfinished clauses; summary briefly states the evidence."
                         ),
                     },
                     {"role": "user", "content": content},
@@ -566,10 +583,20 @@ class PromptGenerator(Monitorable):
                 response_format={"type": "json_object"},
             )
             result = json.loads(response.choices[0].message.content)
+            action_satisfied = bool(result.get("satisfied"))
+            scene_change_requested = result.get("scene_change_requested") is True
+            scene_preserved = result.get("scene_preserved") is True
+            missing = result.get("missing") or []
+            if not isinstance(missing, list):
+                missing = [str(missing)]
+            if action_satisfied and not scene_change_requested and not scene_preserved:
+                missing.append("Keep the original location and background recognizable")
             audit = {
-                "satisfied": bool(result.get("satisfied")),
+                "satisfied": action_satisfied and (scene_change_requested or scene_preserved),
                 "progressing": bool(result.get("progressing")),
-                "missing": result.get("missing") or [],
+                "scene_change_requested": scene_change_requested,
+                "scene_preserved": scene_preserved,
+                "missing": missing,
                 "summary": str(result.get("summary") or "")[:300],
             }
             self.comment_adherence_checks += 1
@@ -791,6 +818,8 @@ class PromptGenerator(Monitorable):
                     prompt=prompt_text,
                     reasoning=result['reasoning'],
                     forced_novelty=forced_novelty,
+                    visual_description=str(result.get('visual_description') or "")[:500],
+                    scene_change_requested=result.get('scene_change_requested') is True,
                 )
                 
             except (json.JSONDecodeError, KeyError, AttributeError) as e:

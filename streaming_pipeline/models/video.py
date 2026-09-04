@@ -14,7 +14,7 @@ class LTXVideoRequestI2V(BaseModel):
     # be divisible by 32 and num_frames must be 8*k + 1 for LTX.
     height: int = Field(default=288, description="The height of the video (must be divisible by 32)")
     width: int = Field(default=512, description="The width of the video (must be divisible by 32)")
-    num_frames: int = Field(default=121, description="The number of frames to generate (must be 8*k + 1)")
+    num_frames: int = Field(default=145, description="The number of frames to generate (must be 8*k + 1)")
     # Drives `duration_s = num_frames / frame_rate` inside the LTX 2.3 pipeline,
     # which determines how long the generated audio is.  Should match the RTMP
     # stream's target_fps so audio playback duration aligns with video playback.
@@ -31,7 +31,22 @@ class LTXVideoRequestI2V(BaseModel):
     seed: Optional[int] = Field(default=None, description="Generation seed. If null, a random seed is used per generation")
     force_t2v: bool = Field(
         default=False,
-        description="Use local prompt-first generation for a bounded viewer-command fallback",
+        description="Deprecated compatibility switch for prompt-first generation",
+    )
+    scene_bridge: bool = Field(
+        default=False,
+        description=(
+            "Use a local prompt-first target plus an LTX first/last-frame bridge, "
+            "so difficult viewer commands keep the streamed handoff as a real keyframe"
+        ),
+    )
+    scene_description: str = Field(
+        default="",
+        description="Visual description of the current scene used to lock bridge targets",
+    )
+    preserve_scene: bool = Field(
+        default=True,
+        description="Keep the current location/background unless the viewer explicitly changes it",
     )
 
     # LTX 2.3 Condition pipeline: character reference images

@@ -2,7 +2,7 @@
 
 > A local-first fork of [alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv): Twitch chat drives an evolving story, ComfyUI + LTX 2.5 generates the next clip on a local RTX 5090, and FFmpeg keeps the stream alive.
 
-**目前穩定版已把影片生成移到單張 RTX 5090 本機執行。** 第二段開始，一般段落都使用上一段「實際送進串流」的最後一格做 Image-to-Video；只有 viewer command 連續兩次未通過視覺驗收時，才會在第三次以同一套本機 LTX 做 prompt-first fallback，再從 exact handoff 平滑銜接。劇情、留言字幕和 RTMP queue 也一起做了連續性與存活性保護。已知限制是段落交界仍偶爾有輕微動作跳動，這是下一輪優化重點。
+**目前穩定版已把影片生成移到單張 RTX 5090 本機執行。** 第二段開始，一般段落都使用上一段「實際送進串流」的最後一格做 Image-to-Video。viewer command 連續兩次未通過視覺驗收時，第三次會在本機建立場景鎖定的目標 keyframe，再以 LTX 首／尾影格雙 guide 生成轉場；不再用會整個換景的純 T2V fallback。劇情、留言字幕和 RTMP queue 也一起做了連續性與存活性保護。
 
 ## The important correction: local vs. fal.ai
 
@@ -34,7 +34,8 @@ Merely having a `FAL_KEY` is no longer permission to spend money.
 - Pixel-exact visible seam: clip `N`'s streamed final frame equals clip `N+1`'s first streamed frame.
 - The exact post-repair committed tail is atomically snapshotted for restart recovery; ComfyUI's pre-repair output is never mistaken for stream state.
 - Transactional story state: a clip advances the handoff and prompt history only after all frames are accepted by RTMP.
-- LTX temporal-padding trim: a 121-frame request currently decodes 129 frames; frames 122–129 are discarded.
+- LTX temporal-padding trim: any decoded frames beyond the requested `8*k+1` payload are discarded.
+- Terminal-blur guard: the next handoff uses the latest acceptably sharp generated-and-streamed frame, then temporally resamples without pixel blending.
 - Border/corruption guard for hard bars and soft chromatic/vignette halos, with adaptive full-bleed repair.
 - Local recovery segment after repeated bad generations, so the channel never deadlocks on one frame.
 - RTMP backpressure capped around one clip instead of accumulating minutes of latency.
@@ -44,17 +45,18 @@ Merely having a `FAL_KEY` is no longer permission to spend money.
 
 ## Current measured result
 
-RTX 5090, Windows, local ComfyUI LTX 2.5 NVFP4, 512×288, 121 requested frames:
+RTX 5090, Windows, local ComfyUI LTX 2.5 NVFP4, 512×288. The current default is 145 requested frames; the snapshot below records the earlier 121-frame production baseline:
 
 | Measurement | Result | Context |
 |---|---:|---|
 | Raw ComfyUI bridge generation | ~5.1–7.1 s | Controlled local tests; video-only is faster than AV retrieval |
 | End-to-end live cycle | **13.53 s average** | 29 consecutive start-to-start intervals, including prompt, generation and backpressure |
-| Stream payload per clip | 121 frames / 13.44 s | Dripped at 9 FPS |
+| Current stream payload per clip | 145 frames / 16.11 s | Dripped at 9 FPS; fewer visible joins |
+| Fresh 145-frame live validation | **13.89 s average** | 7 consecutive clips, 1,198 sent frames, 0 dropped/rejected; terminal-blur guard activated twice |
 | Sustained RTMP rate | **8.9–9.0 / 9 FPS** | Twitch production run |
 | Snapshot | 90 clips, 10,948 frames | 0 dropped, 0 rejected, queue 9.4 s |
 | Recovery activity | 3 adaptive repairs | 0 forced recovery segments in that snapshot |
-| Automated continuity tests | **26 / 26 passing** | Seam, persisted handoff, padding, soft halo, recovery, queue, comment control and provider checks |
+| Automated continuity tests | **30 / 30 passing** | Seam, dual-guide bridge, terminal blur, persisted handoff, padding, halo, recovery, queue and comment control |
 
 These numbers are workload- and driver-dependent. The honest production metric is the end-to-end cycle, not just the denoising kernel time.
 
@@ -84,7 +86,7 @@ Streaming engine ── story transaction + quality/recovery state machine
     ▼
 ComfyUI HTTP API ── local LTX 2.5 NVFP4 Image-to-Video
     │
-    ├── clean frame 121 ──► next clip's frame 1
+    ├── latest sharp streamed tail ──► next clip's exact frame 1
     │
     └── stream-only copy ──► comment/prompt overlay ──► FFmpeg ──► Twitch
 ```
@@ -93,11 +95,11 @@ ComfyUI HTTP API ── local LTX 2.5 NVFP4 Image-to-Video
 
 ### 1. The generated first frame is not automatically exact
 
-`LTXVAddGuide` conditions frame 0, but VAE encode/decode can still alter pixels. We replace the visible first output frame with the committed previous tail. This removes a hard cut at the seam.
+`LTXVAddGuide` conditions frame 0, but VAE encode/decode can still alter pixels. We prepend the committed previous tail, retain ComfyUI's decoded frame 0 as the second streamed frame, and drop the weakest terminal frame. This removes a hard cut without skipping the model's natural first motion step.
 
 ### 2. The last decoded frame was not the requested last frame
 
-Our 121-frame graph produced 129 decoded frames. The last eight are temporal padding and can degrade. Feeding frame 129 into the next clip created a long autoregressive corruption loop. We now stream and chain only frames 1–121.
+Our earlier 121-frame graph produced 129 decoded frames. The last eight were temporal padding and could degrade. Feeding frame 129 into the next clip created a long autoregressive corruption loop. We now trim every graph to its requested payload and independently reject a motion-blurred terminal handoff.
 
 ### 3. A perfect pixel seam does not guarantee perfect motion
 
@@ -113,7 +115,7 @@ A Twitch comment can be correctly received, selected and burned into frames yet 
 
 ### 6. A displayed comment is not necessarily an executed command
 
-The old prompt stage could select `鏡頭拉遠 這個生物戴上眼鏡` but silently turn it into “the creature notices glasses,” dropping both the camera move and the completed action. Comments are now authoritative FIFO commands. A dedicated compiler translates only the current comment into a literal English video action while retaining the original text verbatim. A stricter before/middle/end audit runs before RTMP: failed clips receive no caption, never reach viewers, never become the next handoff, and never enter story history. Retries progressively release the image guide (`0.30 → 0.10`); if the old subject is still locked, a third local prompt-first LTX attempt is eased from the exact streamed frame over eight frames. Only a visually verified clip is captioned and committed. Ordinary story clips remain I2V.
+The old prompt stage could select `鏡頭拉遠 這個生物戴上眼鏡` but silently turn it into “the creature notices glasses,” dropping both the camera move and the completed action. Comments are now authoritative FIFO commands. A dedicated compiler translates only the current comment into a literal English video action while retaining the original text verbatim. A stricter before/middle/end audit runs before RTMP: failed clips receive no caption, never reach viewers, never become the next handoff, and never enter story history. Retries use a scene-first guide schedule (`0.70 → 0.45 → 0.20`). On the third attempt, prompt-first LTX creates only a completed target keyframe; an official-style first/last-frame graph then connects the actual streamed tail to that scene-locked target. Only a visually verified clip is captioned and committed. Ordinary story clips remain I2V.
 
 ### 7. Soft coloured halos are different from black bars
 
@@ -184,7 +186,7 @@ COMFYUI_DIR=C:\path\to\ComfyUI
 
 USE_FAL_OPENROUTER=false
 ENABLE_FAL_VIDEO=false
-COMMENT_I2V_STRENGTH_SCHEDULE=0.30,0.10,0.0
+COMMENT_I2V_STRENGTH_SCHEDULE=0.70,0.45,0.20
 ```
 
 `.env`, logs, model weights, output frames, virtual environments and generated media are gitignored. Never paste keys into scripts, prompts, screenshots or Git remote URLs.

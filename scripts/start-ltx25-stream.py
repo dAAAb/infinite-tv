@@ -49,7 +49,7 @@ def main() -> None:
         "negative_prompt": DEFAULT_NEGATIVE,
         "width": 512,
         "height": 288,
-        "num_frames": 121,
+        "num_frames": 145,
         "frame_rate": 9.0,
         "target_fps": 9.0,
         "strength": 1.0,

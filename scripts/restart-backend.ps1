@@ -66,9 +66,9 @@ $env:LTX25_RECOVERY_INSET_RATIO = "0.18"
 # buffered clip instead of sitting behind several minutes of generated frames.
 $env:RTMP_TARGET_QUEUE_SECONDS = "18"
 # Viewer commands use bounded pre-stream retries. Ordinary story clips stay
-# I2V; the third failed command attempt uses local prompt-first LTX with an
-# exact-frame transition. gpt-4o is used only for low-frequency acceptance QA.
-$env:COMMENT_I2V_STRENGTH_SCHEDULE = "0.30,0.10,0.0"
+# I2V; the third failed command attempt uses a local target keyframe plus LTX
+# first/last-frame conditioning. gpt-4o is only for low-frequency acceptance QA.
+$env:COMMENT_I2V_STRENGTH_SCHEDULE = "0.70,0.45,0.20"
 $env:COMMENT_MAX_ADHERENCE_ATTEMPTS = "3"
 $env:OPENAI_COMMENT_AUDIT_MODEL = "gpt-4o"
 # torch 2.9 Windows: disable inductor static CUDA launcher so torch.compile

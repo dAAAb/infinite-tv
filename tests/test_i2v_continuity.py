@@ -14,8 +14,11 @@ from streaming_pipeline.models import LTXVideoResponseWithFrames, StreamingState
 from streaming_pipeline.models import TwitchComment
 from streaming_pipeline.prompt_generation.prompt_generator import PromptResult
 from streaming_pipeline.video_generation.comfy_ltx25_backend import (
+    _build_prompt_flf_video_only,
     _build_prompt_i2v_video_only,
+    _prepend_exact_handoff,
     _prepare_handoff_frame,
+    _scene_locked_target,
     _trim_generated_frames,
 )
 from streaming_pipeline.output.rtmp_streamer import FFmpegRTMPStreamer
@@ -218,6 +221,59 @@ class HandoffFrameTests(unittest.TestCase):
         self.assertNotIn("LTXVConcatAVLatent", classes)
         self.assertNotIn("LTXVSeparateAVLatent", classes)
 
+    def test_first_last_frame_graph_chains_two_real_guides(self):
+        graph = _build_prompt_flf_video_only(
+            "first.png", "last.png", "transform", "", 512, 288, 145, 9.0, 123
+        )
+
+        self.assertEqual("LTXVAddGuide", graph["12"]["class_type"])
+        self.assertEqual(0, graph["12"]["inputs"]["frame_idx"])
+        self.assertEqual("LTXVAddGuide", graph["13"]["class_type"])
+        self.assertEqual(-1, graph["13"]["inputs"]["frame_idx"])
+        self.assertEqual(["12", 2], graph["13"]["inputs"]["latent"])
+        self.assertEqual(["13", 2], graph["17"]["inputs"]["latent_image"])
+
+    def test_exact_handoff_is_prepended_without_skipping_decoded_frame_zero(self):
+        source = Image.new("RGB", (8, 8), (1, 2, 3))
+        generated = [
+            Image.new("RGB", (8, 8), (value, 0, 0)) for value in (10, 20, 30)
+        ]
+
+        joined = _prepend_exact_handoff(generated, source)
+
+        self.assertEqual(3, len(joined))
+        self.assertEqual((1, 2, 3), joined[0].getpixel((0, 0)))
+        self.assertEqual((10, 0, 0), joined[1].getpixel((0, 0)))
+        self.assertEqual((20, 0, 0), joined[2].getpixel((0, 0)))
+
+    def test_scene_locked_target_keeps_outer_set_and_changes_center(self):
+        source = Image.new("RGB", (128, 72), (20, 40, 60))
+        target = Image.new("RGB", (128, 72), (220, 180, 100))
+
+        locked = _scene_locked_target(source, target, preserve_scene=True)
+
+        corner = np.asarray(locked)[0, 0].astype(int)
+        center = np.asarray(locked)[36, 64].astype(int)
+        source_color = np.array([20, 40, 60])
+        target_color = np.array([220, 180, 100])
+        self.assertLess(np.linalg.norm(corner - source_color), np.linalg.norm(corner - target_color))
+        self.assertLess(np.linalg.norm(center - target_color), np.linalg.norm(center - source_color))
+
+    def test_terminal_blur_guard_ends_on_a_sharp_generated_frame(self):
+        checker = np.indices((72, 128)).sum(axis=0) % 2 * 255
+        sharp = Image.fromarray(np.repeat(checker[..., None], 3, axis=2).astype(np.uint8), "RGB")
+        blurred = Image.new("RGB", (128, 72), (127, 127, 127))
+        streamer = RealtimeVideoStreamer.__new__(RealtimeVideoStreamer)
+        streamer._terminal_blur_trims = 0
+
+        stabilized = streamer._stabilize_terminal_blur(
+            [sharp.copy() for _ in range(8)] + [blurred]
+        )
+
+        self.assertEqual(9, len(stabilized))
+        self.assertEqual(sharp.tobytes(), stabilized[-1].tobytes())
+        self.assertEqual(1, streamer._terminal_blur_trims)
+
     def test_committed_handoff_snapshot_is_exact_and_atomic(self):
         array = np.arange(64 * 36 * 3, dtype=np.uint8).reshape((36, 64, 3))
         frame = Image.fromarray(array, "RGB")
@@ -391,7 +447,7 @@ class RecoveryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         await streamer._generate_next_video(use_initial_prompt=False)
 
-        self.assertEqual(0.30, generator.requests[0].strength)
+        self.assertEqual(0.70, generator.requests[0].strength)
         self.assertEqual(1.0, generator.requests[0].guidance_scale)
         self.assertEqual(0, streamer.state.generation_count)
         self.assertEqual([], rtmp.batches)
@@ -402,15 +458,17 @@ class RecoveryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         await streamer._generate_next_video(use_initial_prompt=False)
 
-        self.assertEqual(0.10, generator.requests[1].strength)
+        self.assertEqual(0.45, generator.requests[1].strength)
         self.assertFalse(generator.requests[1].force_t2v)
+        self.assertFalse(generator.requests[1].scene_bridge)
         self.assertEqual(0, streamer.state.generation_count)
         self.assertEqual([], rtmp.batches)
 
         await streamer._generate_next_video(use_initial_prompt=False)
 
-        self.assertEqual(0.0, generator.requests[2].strength)
-        self.assertTrue(generator.requests[2].force_t2v)
+        self.assertEqual(0.20, generator.requests[2].strength)
+        self.assertFalse(generator.requests[2].force_t2v)
+        self.assertTrue(generator.requests[2].scene_bridge)
         self.assertEqual(1, streamer.state.generation_count)
         self.assertEqual(1, len(rtmp.batches))
         self.assertEqual(healthy.tobytes(), rtmp.batches[0][0].tobytes())
