@@ -194,10 +194,9 @@ system_prompt = PROMPT_CHAOTIC if VISUAL_MODE else PROMPT_CHAOTIC
 class PromptGenerator(Monitorable):
     CONTEXT_WINDOW_SIZE = 10
     USE_GROQ = True
-    # When FAL_KEY is available, route through fal's OpenRouter proxy first
-    # so all LLM usage is billed via the fal account instead of requiring
-    # separate OpenAI/Groq keys.
-    USE_FAL_OPENROUTER = True
+    # fal billing must be an explicit opt-in.  Merely having FAL_KEY available
+    # must not silently route every vision/prompt request through fal.
+    USE_FAL_OPENROUTER = os.getenv("USE_FAL_OPENROUTER", "false").lower() == "true"
 
     def __init__(
         self,
@@ -266,6 +265,8 @@ class PromptGenerator(Monitorable):
         self.last_input_length = 0
         self.last_output_length = 0
         self.last_generation_time = 0.0
+        self.last_provider = "none"
+        self.last_model = "none"
 
     def set_style_preset(self, name: str) -> None:
         """Apply a named style preset (system prompt + temperature)."""
@@ -282,9 +283,9 @@ class PromptGenerator(Monitorable):
 
         Preference order:
           1. Local OpenAI-compatible endpoint (when configured)
-          2. fal → OpenRouter (unified billing via FAL_KEY)
-          3. Groq (fastest inference, when GROQ_API_KEY is set)
-          4. OpenAI direct
+          2. OpenAI direct
+          3. Groq (when GROQ_API_KEY is set)
+          4. fal → OpenRouter (only when USE_FAL_OPENROUTER=true)
         """
         needs_vision = self.VISUAL_MODE and context.current_frame_base64
 
@@ -294,11 +295,14 @@ class PromptGenerator(Monitorable):
             print(f"🏠 Using local {label} model: {model}")
             return model, self.local_client
 
-        if self.fal_openrouter_client:
-            model = self.fal_vision_model if needs_vision else self.fal_text_model
-            label = "vision" if needs_vision else "text"
-            print(f"🛰️  Using fal→OpenRouter {label} model: {model}")
-            return model, self.fal_openrouter_client
+        if self.openai_client:
+            if needs_vision:
+                model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+                print(f"🖼️ Using OpenAI vision model: {model}")
+                return model, self.openai_client
+            model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini")
+            print(f"🤖 Using OpenAI text model: {model}")
+            return model, self.openai_client
 
         if self.USE_GROQ and self.groq_client:
             if needs_vision:
@@ -307,12 +311,11 @@ class PromptGenerator(Monitorable):
             print("⚡ Using Groq llama-3.1-8b-instant for MAXIMUM SPEED")
             return "llama-3.1-8b-instant", self.groq_client
 
-        if self.openai_client:
-            if needs_vision:
-                print("🔄 Falling back to OpenAI GPT-4o for vision")
-                return "gpt-4o", self.openai_client
-            print("🔄 Falling back to OpenAI GPT-4o-mini")
-            return "gpt-4o-mini", self.openai_client
+        if self.fal_openrouter_client:
+            model = self.fal_vision_model if needs_vision else self.fal_text_model
+            label = "vision" if needs_vision else "text"
+            print(f"🛰️  Using fal→OpenRouter {label} model: {model}")
+            return model, self.fal_openrouter_client
 
         raise RuntimeError("No LLM client available for prompt generation")
 
@@ -364,6 +367,8 @@ class PromptGenerator(Monitorable):
         # Select model and client
         model, client = self._select_model_and_client(context)
         provider_label = self._provider_label(client)
+        self.last_provider = provider_label
+        self.last_model = model
 
         print(f"🤖 Using {model} ({provider_label}) for prompt generation")
         
@@ -523,6 +528,8 @@ class PromptGenerator(Monitorable):
         self.last_input_length = 0
         self.last_output_length = 0
         self.last_generation_time = 0.0
+        self.last_provider = "none"
+        self.last_model = "none"
         print("🧹 Prompt generation metrics reset")
     
     def get_status(self) -> Dict[str, Any]:
@@ -533,5 +540,7 @@ class PromptGenerator(Monitorable):
             "avg_response_time": round(avg_response_time, 3),
             "last_input_length": self.last_input_length,
             "last_output_length": self.last_output_length,
-            "last_generation_time": round(self.last_generation_time, 3)
+            "last_generation_time": round(self.last_generation_time, 3),
+            "provider": self.last_provider,
+            "model": self.last_model,
         }

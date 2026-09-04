@@ -66,8 +66,8 @@ class StreamingService:
             self.rtmp_streamer = FFmpegRTMPStreamer(
                 stream_key=stream_key,
                 fps=9,
-                width=640,
-                height=480,
+                width=768,
+                height=432,
                 bgm_path=bgm,
             )
         else:
@@ -75,9 +75,9 @@ class StreamingService:
             print("⚠️ TWITCH_STREAM_KEY not set -- RTMP output disabled, WebRTC only")
 
         # WebRTC streamer (always available; no external secrets needed)
-        self.webrtc_streamer = WebRTCStreamer(fps=9, width=512, height=384)
+        self.webrtc_streamer = WebRTCStreamer(fps=9, width=768, height=432)
 
-        self.text_overlay = TextOverlay(width=640, height=480)
+        self.text_overlay = TextOverlay(width=768, height=432)
 
         # Default streamer is RTMP (if available), switchable per /start_stream request
         active_streamer = self.rtmp_streamer or self.webrtc_streamer
@@ -134,7 +134,9 @@ class StreamingService:
                 ltx_updates['guidance_scale'] = request.guidance_scale
             if request.strength is not None:
                 ltx_updates['strength'] = request.strength
-            if request.negative_prompt:
+            # Empty is meaningful for LTX-2.5 distilled (the official workflow
+            # defaults to no negative prompt), so do not treat it as "missing".
+            if request.negative_prompt is not None:
                 ltx_updates['negative_prompt'] = request.negative_prompt
             if request.width:
                 ltx_updates['width'] = request.width
@@ -303,6 +305,8 @@ class StreamingService:
             }
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return {
                 "status": "error",
                 "message": f"Failed to start streaming: {e}"

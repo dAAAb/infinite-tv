@@ -1,289 +1,297 @@
-# Infinite TV — AI-Generated Live Stream
+# Infinite TV on one RTX 5090
 
-> **Fork of [alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv)** with Windows (RTX 5090 / Blackwell) support, local GPU inference, `torch.compile` acceleration, and production-tested Twitch streaming.
+> A local-first fork of [alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv): Twitch chat drives an evolving story, ComfyUI + LTX 2.5 generates the next clip on a local RTX 5090, and FFmpeg keeps the stream alive.
 
-A real-time AI video generation system that listens to Twitch chat and streams live AI-generated videos. Built on the **LTX Video 2.3** distilled diffusion model, running entirely on a local GPU.
+**目前穩定版已把影片生成移到單張 RTX 5090 本機執行。** 第二段開始，每段都使用上一段「實際送進串流」的最後一格做 Image-to-Video；劇情、留言字幕和 RTMP queue 也一起做了連續性與存活性保護。已知限制是段落交界仍偶爾有輕微動作跳動，這是下一輪優化重點。
 
-## What Changed in This Fork
+## The important correction: local vs. fal.ai
 
-### 🖥️ Full Windows Support
-- **RTMP streamer**: Replaced Unix FIFO pipes with Windows named pipes (`CreateNamedPipeW`) for audio streaming — the original only worked on Linux/macOS.
-- **Model loading**: Replaced hardcoded Linux paths (`/data/models/...`) with environment-variable-driven paths.
-- **File preloading**: Replaced `find | xargs cat` with a Python `ThreadPoolExecutor` fallback on Windows.
-- **Twitch listener**: Added UTF-8 encoding fixes for Windows console output.
+During development we tested two billable fal.ai video routes (`ltx-2.3` and `h3-max`). An earlier prompt implementation also preferred fal's OpenRouter proxy whenever `FAL_KEY` existed. That produced real fal.ai usage and made the phrase "fully local" inaccurate for that part of the journey.
 
-### ⚡ torch.compile Acceleration
-- Added **`torch.compile(mode="reduce-overhead")`** support for the transformer, gated by `LTX23_TORCH_COMPILE=true`.
-- On Windows, this requires [`triton-windows`](https://github.com/triton-lang/triton-windows) — install with `pip install triton-windows`.
-- **Performance impact**: ~150s → ~35s per generation segment on RTX 5090 (**~77% faster**).
-- Note: `max-autotune` mode doesn't work with triton-windows due to `CompiledKernel.launch_enter_hook` mismatch — `reduce-overhead` is used instead.
-- We also contributed a [compatibility fix (PR #53)](https://github.com/triton-lang/triton-windows/pull/53) back to triton-windows for a `triton_key` import error that blocked `torch.compile`.
+The production path documented below is different:
 
-### 🎛️ Configurable Inference Parameters
-- **Denoising steps**: Now configurable via `num_inference_steps` (default: 5). The original hardcoded 8 steps. Fewer steps = faster generation with the distilled model.
-- **Sigma schedule**: Automatically subsamples the distilled sigma values when using fewer than 8 steps.
-- **CPU offload toggle**: `LTX23_CPU_OFFLOAD` env var (default: `true`) — disable for GPUs with enough VRAM to keep everything on-device.
-- **Condition pipeline**: Lazy-loaded via `LOAD_LTX23_CONDITION=true` instead of always loading.
+- video: **local ComfyUI at `127.0.0.1:8188`**, model `ltx25-comfy`;
+- prompt/vision: direct OpenAI by default (`gpt-4o-mini`), or a local OpenAI-compatible endpoint;
+- fal prompt routing: disabled unless `USE_FAL_OPENROUTER=true`;
+- fal video: blocked unless **both** `ENABLE_FAL_VIDEO=true` and `FAL_KEY` are set;
+- local launch scripts force both fal switches off.
 
-### 🎵 Background Music (BGM)
-- Added `RTMP_BGM_PATH` support — loops an audio file as background music on the Twitch stream.
-- Audio mixing works alongside LTX 2.3's natively generated audio.
+Merely having a `FAL_KEY` is no longer permission to spend money.
 
-### 📊 Other Improvements
-- WebRTC output mode alongside RTMP
-- Style presets (`cohesive`, `chaotic`, `nightmare`, `custom`)
-- Character reference support via `ltx-2.3-condition` mode
-- Hot-reloadable generation parameters via `/update_config`
-- Local LLM endpoint support for prompt generation (`LLM_BASE_URL`)
+| Model id | Video compute | Default availability |
+|---|---|---|
+| `ltx25-comfy` | Local ComfyUI / RTX GPU | **Default** |
+| `ltx-2.3-local` | Local Diffusers / RTX GPU | Optional legacy path |
+| `ltx-2.3-condition` | Local Diffusers / RTX GPU | Optional legacy path |
+| `ltxv1` | Local Diffusers / RTX GPU | Optional legacy path |
+| `ltx-2.3` | fal.ai cloud | Blocked until explicit opt-in |
+| `h3-max` | fal.ai cloud | Blocked until explicit opt-in |
 
----
+## What works now
 
-## Quick Start (Local GPU)
+- Local LTX 2.5 NVFP4 generation through ComfyUI.
+- Image-to-Video chaining after the first clip.
+- Pixel-exact visible seam: clip `N`'s streamed final frame equals clip `N+1`'s first streamed frame.
+- Transactional story state: a clip advances the handoff and prompt history only after all frames are accepted by RTMP.
+- LTX temporal-padding trim: a 121-frame request currently decodes 129 frames; frames 122–129 are discarded.
+- Border/corruption guard with adaptive 12% / 16% / 20% full-bleed repair.
+- Local recovery segment after repeated bad generations, so the channel never deadlocks on one frame.
+- RTMP backpressure capped around one clip instead of accumulating minutes of latency.
+- Twitch comments rendered on stream copies only; the clean final frame continues the I2V chain.
+- Windows named-pipe audio/BGM support and orphaned-FFmpeg cleanup.
+
+## Current measured result
+
+RTX 5090, Windows, local ComfyUI LTX 2.5 NVFP4, 512×288, 121 requested frames:
+
+| Measurement | Result | Context |
+|---|---:|---|
+| Raw ComfyUI bridge generation | ~5.1–7.1 s | Controlled local tests; video-only is faster than AV retrieval |
+| End-to-end live cycle | **13.53 s average** | 29 consecutive start-to-start intervals, including prompt, generation and backpressure |
+| Stream payload per clip | 121 frames / 13.44 s | Dripped at 9 FPS |
+| Sustained RTMP rate | **8.9–9.0 / 9 FPS** | Twitch production run |
+| Snapshot | 90 clips, 10,948 frames | 0 dropped, 0 rejected, queue 9.4 s |
+| Recovery activity | 3 adaptive repairs | 0 forced recovery segments in that snapshot |
+| Automated continuity tests | **14 / 14 passing** | Seam, padding, border, recovery, queue and overlay checks |
+
+These numbers are workload- and driver-dependent. The honest production metric is the end-to-end cycle, not just the denoising kernel time.
+
+### How the optimization journey evolved
+
+| Stage | Result | What we learned |
+|---|---:|---|
+| Original local LTX 2.3 baseline | ~248 s / segment | A direct port was functional but not live-streamable |
+| Fewer frames / diffusion steps | ~150 s | Easy speedup, still far behind playback |
+| Earlier LTX 2.3 `torch.compile` experiment | ~35 s | Promising historical result, but not the final production path |
+| Later real-model Windows compile validation | Failed on Triton cache/group files | Synthetic compile tests were not enough; do not claim this as a stable recipe |
+| LTX 2.5 NVFP4 in ComfyUI | ~5–7 s raw bridge; ~13.5 s live cycle | The first practical single-5090 path for this stream |
+
+The final win did not come from one magic flag. It came from changing the model/runtime path, then engineering the queue, handoff and recovery behavior around it.
+
+## Architecture
+
+```text
+Twitch chat
+    │
+    ▼
+Prompt generator ── OpenAI direct or local LLM
+    │
+    ▼
+Streaming engine ── story transaction + quality/recovery state machine
+    │
+    ▼
+ComfyUI HTTP API ── local LTX 2.5 NVFP4 Image-to-Video
+    │
+    ├── clean frame 121 ──► next clip's frame 1
+    │
+    └── stream-only copy ──► comment/prompt overlay ──► FFmpeg ──► Twitch
+```
+
+## Why continuous I2V is harder than it looks
+
+### 1. The generated first frame is not automatically exact
+
+`LTXVAddGuide` conditions frame 0, but VAE encode/decode can still alter pixels. We replace the visible first output frame with the committed previous tail. This removes a hard cut at the seam.
+
+### 2. The last decoded frame was not the requested last frame
+
+Our 121-frame graph produced 129 decoded frames. The last eight are temporal padding and can degrade. Feeding frame 129 into the next clip created a long autoregressive corruption loop. We now stream and chain only frames 1–121.
+
+### 3. A perfect pixel seam does not guarantee perfect motion
+
+Each clip is still independently denoised. Velocity and motion blur are not carried across the boundary, so a small motion jump can remain even when the joining pixels are identical. This is the main open quality issue; likely next steps are overlap-aware generation, optical-flow-assisted transition scoring, or motion-state conditioning rather than a cosmetic crossfade.
+
+### 4. Rejecting every bad clip can freeze a live channel
+
+The upstream project keeps output alive by replaying the last frame when its queue is empty. A strict quality gate added safety but could repeatedly reject clips from the same poisoned handoff. The current bounded state machine tries local repairs, reuses the same prompt without another LLM bill, then emits a local push-in recovery clip and continues.
+
+### 5. A huge queue makes interaction look broken
+
+A Twitch comment can be correctly received, selected and burned into frames yet remain invisible for minutes if those frames sit behind an oversized queue. Backpressure now targets 18 seconds. Comment text is displayed for roughly 85% of its clip and verified at the pixel level before send.
+
+## Reproduce the local RTX 5090 setup
+
+This is the tested Windows path. Other NVIDIA GPUs may work with lower resolution or different quantization, but the published numbers are from a 32 GB RTX 5090.
 
 ### Prerequisites
 
-- **GPU**: NVIDIA with CUDA support (tested on RTX 5090 / Blackwell)
-- **Python 3.11+**
-- **Node.js 18+** (for dashboard)
-- **FFmpeg** installed and in PATH
-- **CUDA Toolkit** installed
-- Twitch account + stream key
-- OpenAI API key (for prompt generation)
+- Windows 11
+- NVIDIA RTX 5090 with a working CUDA/PyTorch driver stack
+- Python 3.11+
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) recent enough to include the LTXV nodes used by the API graph
+- FFmpeg in `PATH`
+- Node.js 18+ for the optional dashboard
+- Twitch account + stream key for RTMP output
+- OpenAI API key, or a local OpenAI-compatible LLM endpoint, for story prompts
 
-### 1. Clone and Setup
+### 1. Clone and install the controller
 
-```bash
+```powershell
 git clone https://github.com/dAAAb/infinite-tv.git
 cd infinite-tv
-
-# Create virtual environment
 python -m venv .venv
-.venv\Scripts\activate  # Windows
-# source .venv/bin/activate  # Linux/macOS
-
-# Install dependencies
+.\.venv\Scripts\Activate.ps1
 pip install -e .
 
-# (Optional, Windows only) Enable torch.compile acceleration
-pip install triton-windows
+cd dashboard
+npm install
+cd ..
 ```
 
-### 2. Download Models
+fal.ai is not installed by the local setup. If you intentionally want the optional cloud models, install `requirements-cloud.txt` and enable the runtime guard explicitly.
 
-The LTX 2.3 distilled model (~15 GB) downloads automatically on first run from HuggingFace. To pre-download:
+### 2. Install the LTX 2.5 files in ComfyUI
 
-```bash
-python -c "from huggingface_hub import snapshot_download; snapshot_download('dg845/LTX-2.3-Distilled-Diffusers', local_dir='models/ltx-2.3-distilled-v2')"
+Download the official files from [Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) and place them where ComfyUI's loaders expect them:
+
+```text
+ComfyUI/models/diffusion_models/
+  ltx-2.5-22b-distilled-transformer-nvfp4.safetensors
+ComfyUI/models/text_encoders/
+  gemma4-12b-with-proj-ltx-2.5-bf16.safetensors
+ComfyUI/models/vae/
+  ltx-2.5-video-vae-bf16.safetensors
 ```
 
-### 3. Environment Configuration
+The production Twitch graph is video-only; BGM is mixed by FFmpeg, so the LTX audio VAE is not required for this path.
 
-Copy `.env.example` to `.env` and fill in:
+### 3. Configure secrets locally
 
-```env
-# Model selection
-LOAD_LTX23_PIPELINE=true
-LOAD_LOCAL_PIPELINE=false
-LOAD_LTX23_CONDITION=false
+```powershell
+Copy-Item .env.example .env
+```
 
-# GPU settings
-LTX23_CPU_OFFLOAD=false          # Set false if you have enough VRAM (>24GB)
-LTX23_TORCH_COMPILE=true         # Requires triton-windows on Windows
-PRELOAD_MODEL_FILES=false
+Edit `.env` locally:
 
-# Model paths (auto-downloaded if not present)
-LTX23_WEIGHTS_DIR=./models/ltx-2.3-distilled-v2
-LTX_WEIGHTS_DIR=./models/ltx-video-0.9.8-13b
-
-# API keys
-OPENAI_API_KEY=your_key_here
-FAL_KEY=your_key_here             # Only needed for fal.ai cloud mode
-
-# Twitch
+```dotenv
+OPENAI_API_KEY=your_openai_key
 TWITCH_CHANNEL=your_channel
 TWITCH_STREAM_KEY=your_stream_key
 
-# Optional
-RTMP_BGM_PATH=./outputs/bgm-lofi.mp3   # Background music
-RUN_GENERATION_INLINE=true
+COMFY_SERVER=127.0.0.1:8188
+COMFYUI_DIR=C:\path\to\ComfyUI
 
-# Optional: local LLM for prompt generation
-# LLM_BASE_URL=http://127.0.0.1:8080/v1
-# LLM_TEXT_MODEL=local
+USE_FAL_OPENROUTER=false
+ENABLE_FAL_VIDEO=false
 ```
 
-### 4. Start Backend
+`.env`, logs, model weights, output frames, virtual environments and generated media are gitignored. Never paste keys into scripts, prompts, screenshots or Git remote URLs.
+
+### 4. Start ComfyUI
+
+From your ComfyUI directory:
 
 ```powershell
-# Windows (PowerShell)
+.\.venv\Scripts\python.exe main.py --reserve-vram 2
+```
+
+Verify `http://127.0.0.1:8188/system_stats` responds.
+
+### 5. Start Infinite TV
+
+```powershell
 .\scripts\start-local.ps1
 ```
 
-Or manually:
+Or start only the API:
 
-```bash
-python -m uvicorn streaming_pipeline.local_app:app --host 127.0.0.1 --port 8000
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn streaming_pipeline.local_app:app --host 127.0.0.1 --port 8000
 ```
 
-### 5. Start Streaming
+The local launcher explicitly sets:
 
-```bash
-# Start stream via API
-curl -X POST http://127.0.0.1:8000/start_stream \
-  -H "Content-Type: application/json" \
-  -d '{"output_mode": "rtmp", "model": "ltx-2.3", "initial_image_url": "https://example.com/start-image.jpg"}'
+```text
+USE_FAL_OPENROUTER=false
+ENABLE_FAL_VIDEO=false
+LTX25_MAX_CORRUPT_RETRIES=2
+LTX25_RECOVERY_INSET_RATIO=0.18
+RTMP_TARGET_QUEUE_SECONDS=18
 ```
 
-Or use the dashboard at `http://127.0.0.1:3000` (run `cd dashboard && npm install && npm run dev`).
+### 6. Start a stream from a local image
 
-### 6. Dashboard Setup
+Browser/WebRTC test, with no external broadcast:
 
-```bash
+```powershell
+.\.venv\Scripts\python.exe scripts\start-ltx25-stream.py --image .\start.png
+```
+
+Twitch RTMP:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\start-ltx25-stream.py `
+  --image .\start.png `
+  --output-mode rtmp `
+  --prompt "Continue directly from this frame without a cut. The character notices a new signal."
+```
+
+The dashboard is available at `http://127.0.0.1:3000`. Runtime metrics are at `http://127.0.0.1:8000/metrics`.
+
+## Verify before going live
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 cd dashboard
-npm install
-npm run dev
+npm run build
 ```
 
-The dashboard connects to `http://127.0.0.1:8000` and provides real-time monitoring, stream controls, and parameter tuning.
+During a run, check all three kinds of liveness:
 
----
+- `video.generation_count` continues increasing;
+- `rtmp.current_fps` stays near target and `frames_dropped` remains zero;
+- `rtmp.queue_seconds` stays bounded instead of growing for minutes.
 
-## Pitfalls & Gotchas 🕳️
+`generator.backend` and `generator.uses_cloud_video` expose the active video route after the updated backend is running. `prompt.provider` and `prompt.model` show where story generation is billed.
 
-### Windows-Specific Issues
+## Optional fal.ai cloud mode
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| `torch.compile` fails with `ImportError: cannot import name 'triton_key'` | triton-windows missing compat shim for PyTorch Inductor | `pip install triton-windows` + our [triton_key shim](https://github.com/triton-lang/triton-windows/pull/53) |
-| `torch.compile` fails with `launch_enter_hook` error | `max-autotune` mode incompatible with triton-windows | Use `reduce-overhead` mode (already configured) |
-| RTMP audio breaks / pipe errors | Unix FIFOs (`mkfifo`) don't exist on Windows | This fork uses Windows named pipes — already fixed |
-| `UnicodeEncodeError` on console output | Windows console defaults to cp950/cp1252 | Set `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` |
-| `find | xargs cat` fails for model preloading | Unix command, not available on Windows | This fork uses Python `ThreadPoolExecutor` fallback |
+Cloud routes are retained for controlled comparisons, not used by the local recipe.
 
-### General Issues
-
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| First generation takes 3-5 minutes | `torch.compile` warmup (compiling CUDA kernels) | Normal — subsequent generations are fast (~35s) |
-| Stream freezes between segments | Generation slower than playback | Reduce `num_frames` or `num_inference_steps`; enable `torch.compile` |
-| `initial_image_url` required error | No default start image | Pass a start image URL or base64 data URI in `/start_stream` |
-| VRAM OOM | Model too large for GPU | Enable `LTX23_CPU_OFFLOAD=true` or reduce resolution |
-| Twitch stream drops | FFmpeg RTMP timeout | Check `TWITCH_STREAM_KEY`; ensure stable network |
-
----
-
-## Performance Benchmarks (RTX 5090, 24GB VRAM)
-
-| Configuration | Gen Time | RTMP FPS | Notes |
-|--------------|----------|----------|-------|
-| Baseline (8 steps, 17 frames, no compile) | ~248s | ~3.8 | Original upstream settings |
-| 5 steps, 9 frames, no compile | ~150s | ~3.8 | Reduced params only |
-| 5 steps, 9 frames, **torch.compile** | **~35s** | **~8.8** | 🔥 Recommended |
-
-With torch.compile at ~35s per segment and 9 frames sustaining ~54s of playback, the stream runs with **zero freeze time** between generations.
-
----
-
-## API Reference
-
-### `POST /start_stream`
-
-Start video generation and RTMP streaming.
-
-```json
-{
-  "model": "ltx-2.3",
-  "output_mode": "rtmp",
-  "initial_image_url": "https://... or data:image/jpeg;base64,...",
-  "initial_prompt": "A cozy lo-fi study room",
-  "width": 512,
-  "height": 384,
-  "num_frames": 9,
-  "timesteps": [1000, 981, 909, 725, 0.03],
-  "guidance_scale": 1.0,
-  "target_fps": 9.0,
-  "style_preset": "cohesive",
-  "enable_audio": true
-}
+```powershell
+pip install -r requirements-cloud.txt
+$env:ENABLE_FAL_VIDEO = "true"
+$env:FAL_KEY = "..."
 ```
 
-### `POST /stop_stream`
+Then explicitly select `ltx-2.3` or `h3-max`. Pricing and availability change; check fal.ai before each run. Keep `ENABLE_FAL_VIDEO=false` for local-only operation.
 
-Stop the streaming pipeline.
+## Lessons learned
 
-### `POST /update_config`
+1. **Provider selection is a spending boundary.** A credential must never silently select a billable route.
+2. **Measure the full loop.** Kernel time is not stream latency; prompt generation, file retrieval, overlays and queue policy matter.
+3. **Commit the frame that viewers actually saw.** Generated-but-rejected or partially queued frames must not advance the I2V chain or story.
+4. **Autoregressive video needs maintenance.** Borders, posterization and saturation errors compound when every tail becomes the next input.
+5. **A live system needs a bounded failure mode.** Quality gates must recover instead of deadlocking.
+6. **Continuity has layers.** Exact pixels, continuous motion, narrative state and interaction latency are separate problems.
 
-Hot-reload generation parameters without stopping the stream.
+## Project structure
 
-```json
-{
-  "num_frames": 9,
-  "guidance_scale": 1.5,
-  "noise_scale": 0.15,
-  "llm_temperature": 0.7,
-  "style_preset": "chaotic"
-}
+```text
+streaming_pipeline/
+  core/streaming_engine.py                 story transaction + recovery
+  video_generation/comfy_ltx25_backend.py  local ComfyUI LTX 2.5 graph
+  video_generation/video_generator.py      provider routing + billing guard
+  output/rtmp_streamer.py                  queue/backpressure + FFmpeg
+  postprocessing/text_overlay.py           prompt/comment burn-in
+  input/twitch_listener.py                 Twitch IRC listener
+scripts/
+  start-local.ps1                          safe local launcher
+  restart-backend.ps1                      RTMP-safe backend restart
+  start-ltx25-stream.py                    reproducible local start request
+tests/
+  test_i2v_continuity.py                   continuity/recovery/overlay tests
+  test_provider_safety.py                  fal.ai opt-in guard tests
+dashboard/                                 Next.js monitoring UI
 ```
-
-### `GET /metrics`
-
-Returns real-time metrics: generation stats, RTMP status, GPU memory, Twitch chat status.
-
-### `WebSocket /metrics/ws`
-
-Real-time metrics stream for the dashboard.
-
----
-
-## Project Structure
-
-```
-infinite-tv/
-├── streaming_pipeline/           # Main Python package
-│   ├── local_app.py             # Local FastAPI entry point
-│   ├── app.py                   # FAL serverless entry point
-│   ├── streaming_service.py     # Orchestration layer
-│   ├── core/
-│   │   └── streaming_engine.py  # Main generation loop
-│   ├── video_generation/
-│   │   └── video_generator.py   # LTX model wrapper + torch.compile
-│   ├── input/
-│   │   └── twitch_listener.py   # Twitch chat integration
-│   ├── output/
-│   │   ├── rtmp_streamer.py     # RTMP via FFmpeg (Windows named pipes)
-│   │   └── webrtc_streamer.py   # WebRTC browser streaming
-│   ├── prompt_generation/
-│   │   └── prompt_generator.py  # LLM-driven prompt generation
-│   ├── postprocessing/
-│   │   └── text_overlay.py      # Video text overlays
-│   ├── models/
-│   │   ├── api.py               # Request/response models
-│   │   ├── video.py             # Video generation config
-│   │   └── streaming.py         # Streaming state
-│   └── utils/
-│       ├── logger_config.py
-│       └── monitoring.py
-├── dashboard/                    # Next.js React dashboard
-├── scripts/
-│   └── start-local.ps1          # Windows startup script
-├── models/                       # Downloaded model weights
-├── outputs/                      # Generated outputs + BGM
-├── .env.example                  # Environment template
-├── pyproject.toml
-├── requirements.txt
-└── README.md
-```
-
----
 
 ## Acknowledgments
 
-- **[alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv)** — Original project
-- **[LTX Video](https://huggingface.co/Lightricks)** — Video generation model
-- **[triton-windows](https://github.com/triton-lang/triton-windows)** — Triton on Windows
-- **[Diffusers](https://github.com/huggingface/diffusers)** — HuggingFace diffusion library
-- **FFmpeg** — Video processing and RTMP streaming
+- [alex-remade/infinite-tv](https://github.com/alex-remade/infinite-tv) — original project and queue-liveness concept
+- [Lightricks LTX Video](https://github.com/Lightricks/LTX-Video) — local video model
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) — practical Windows LTX 2.5 runtime
+- [FFmpeg](https://ffmpeg.org/) — RTMP and audio mixing
 
 ## License
 
-MIT — see [LICENSE](LICENSE) file.
+MIT — see [LICENSE](LICENSE).

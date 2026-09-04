@@ -19,25 +19,25 @@ class UpdateConfigRequest(BaseModel):
 
 class StartStreamRequest(BaseModel):
     # Model Selection
-    model: Optional[Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition"]] = Field(default="ltxv1", description="Which model to use for generation")
+    model: Optional[Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition", "h3-max", "ltx25-comfy"]] = Field(default="ltx25-comfy", description="Which model to use for generation; ltx25-comfy is local-first")
     
     # Basic stream configuration
     initial_prompt: Optional[str] = Field(default=None, description="Custom initial prompt for the stream")
     initial_image_url: Optional[str] = Field(default=None, description="Custom initial image URL for the stream")
     
     # LTX Model Parameters (matching LTXVideoRequestI2V).
-    # Defaults are tuned for the local LTX 2.3 distilled pipeline on GPU-B200:
+    # Defaults are tuned for the continuity-first ComfyUI LTX 2.5 path on RTX 5090:
     #   - height/width chosen to be divisible by 32 (LTX requirement) and small
     #     enough to keep transformer FLOPs low
     #   - num_frames chosen to be `8*k + 1` (LTX requirement); 121 frames @ 9
     #     output FPS is ~13s of stream content, comfortably > one gen cycle
     negative_prompt: Optional[str] = Field(
-        default="worst quality, inconsistent motion, blurry, jittery, distorted, static scene, frozen frame, no motion, repetitive, looping",
+        default="frame, border, vignette, letterbox, pillarbox, black bars, white bars, picture-in-picture, screen-within-screen, oversaturated rainbow edges",
         description="The negative prompt",
     )
-    height: Optional[int] = Field(default=384, description="The height of the video (must be divisible by 32)")
+    height: Optional[int] = Field(default=288, description="The height of the video (must be divisible by 32)")
     width: Optional[int] = Field(default=512, description="The width of the video (must be divisible by 32)")
-    num_frames: Optional[int] = Field(default=9, description="The number of frames to generate (must be 8*k + 1)")
+    num_frames: Optional[int] = Field(default=121, description="The number of frames to generate (must be 8*k + 1)")
     # If unset, streaming_service auto-fills this from target_fps so audio
     # length matches the RTMP stream's playback duration.
     frame_rate: Optional[float] = Field(default=None, description="Generation frame rate (defaults to target_fps to keep audio in sync with playback)")
@@ -53,7 +53,7 @@ class StartStreamRequest(BaseModel):
 
     # LTX 2.3-specific parameters
     duration: Optional[Literal[6, 8, 10, 12, 14, 16, 18, 20]] = Field(default=None, description="Duration in seconds (>10s requires 25fps and 1080p)")
-    resolution: Optional[Literal["1080p", "1440p", "2160p"]] = Field(default=None, description="Resolution for LTX 2.3")
+    resolution: Optional[Literal["480p", "768p", "1080p", "1440p", "2160p"]] = Field(default=None, description="Resolution: LTX 2.3 uses 1080p+, H3 Max Turbo uses 480p/768p")
     aspect_ratio: Optional[Literal["auto", "16:9", "9:16"]] = Field(default=None, description="Aspect ratio for LTX 2.3")
 
     # Streaming Configuration

@@ -139,12 +139,17 @@ class FFmpegRTMPStreamer(Monitorable):
             # Mix in background music if a BGM file is provided.
             if self.bgm_path and os.path.isfile(self.bgm_path):
                 bgm_in = ffmpeg.input(self.bgm_path, stream_loop=-1)
-                # Lower BGM volume so it doesn't overpower LTX audio / sit comfortably
-                bgm_quiet = bgm_in.filter('volume', 0.3)
-                audio_in = ffmpeg.filter([audio_in, bgm_quiet], 'amix',
+                # BGM is the reliable bed (louder); the LTX-generated audio is still
+                # unstable, so it sits underneath. normalize=0 keeps the literal
+                # 0.70 / 0.30 mix instead of amix's default 1/n auto-scaling.
+                bgm_v = float(os.getenv("RTMP_BGM_VOLUME", "0.70"))
+                gen_v = float(os.getenv("RTMP_GEN_AUDIO_VOLUME", "0.30"))
+                bgm_loud = bgm_in.filter('volume', bgm_v)
+                gen_quiet = audio_in.filter('volume', gen_v)
+                audio_in = ffmpeg.filter([gen_quiet, bgm_loud], 'amix',
                                          inputs=2, duration='longest',
-                                         dropout_transition=0)
-                queue_log.info(f"🎵 BGM mixed in: {self.bgm_path} (volume=0.3, loop)")
+                                         dropout_transition=0, normalize=0)
+                queue_log.info(f"🎵 BGM mixed in: {self.bgm_path} (BGM={bgm_v}, gen_audio={gen_v}, loop)")
 
             self.ffmpeg_process = (
                 ffmpeg
@@ -183,6 +188,10 @@ class FFmpegRTMPStreamer(Monitorable):
                 self.audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
                 self.audio_thread.start()
                 queue_log.info("🔊 Audio FIFO writer thread started")
+
+            # Start a stderr monitor so FFmpeg errors are visible in logs.
+            self.monitor_thread = threading.Thread(target=self._monitor_ffmpeg, daemon=True)
+            self.monitor_thread.start()
 
             queue_log.info(f"✅ FFmpeg RTMP stream started - NOW LIVE ON TWITCH!")
             queue_log.info(f"🔗 RTMP URL: {self.rtmp_url}")
@@ -401,50 +410,78 @@ class FFmpegRTMPStreamer(Monitorable):
         
         clip_seconds = len(pil_frames) / max(1, float(self.fps))
         target_seconds = max(clip_seconds, float(playback_seconds or 0))
-        repeat_per_frame = max(1, int(round((target_seconds * float(self.fps)) / len(pil_frames))))
+        target_frame_count = max(
+            len(pil_frames),
+            int(np.ceil(target_seconds * float(self.fps))),
+        )
         max_hold_seconds = float(os.getenv("RTMP_MAX_GENERATED_FRAME_HOLD_SECONDS", "6"))
         max_repeat_per_frame = max(1, int(round(max_hold_seconds * float(self.fps))))
-        if repeat_per_frame > max_repeat_per_frame:
+        max_target_count = len(pil_frames) * max_repeat_per_frame
+        if target_frame_count > max_target_count:
             queue_log.info(
                 f"📺 DRIP CAP: limiting generated frame hold from "
-                f"{repeat_per_frame / float(self.fps):.1f}s to {max_hold_seconds:.1f}s"
+                f"{target_frame_count / len(pil_frames) / float(self.fps):.1f}s "
+                f"to {max_hold_seconds:.1f}s per source frame"
             )
-            repeat_per_frame = max_repeat_per_frame
-        expanded_count = len(pil_frames) * repeat_per_frame
+            target_frame_count = max_target_count
 
         queue_log.info(f"📺 BATCH START: Processing {len(pil_frames)} frames...")
-        if repeat_per_frame > 1:
+        if target_frame_count > len(pil_frames):
             queue_log.info(
-                f"📺 DRIP PLAYBACK: spreading over ~{expanded_count / float(self.fps):.1f}s "
-                f"({repeat_per_frame} stream frames per generated frame)"
+                f"📺 DRIP PLAYBACK: evenly resampling {len(pil_frames)} generated "
+                f"frames to {target_frame_count} stream frames "
+                f"(~{target_frame_count / float(self.fps):.1f}s)"
             )
         queue_log.info(f"📊 Current queue size: {self.frame_queue.qsize()}/{self.frame_queue.maxsize}")
         
         batch_start_time = time.time()
-        processed_count = 0
-        
-        # Convert each generated frame once, then enqueue repeats for paced
-        # playback at the RTMP stream's fixed FPS.
+        prepared_frames = []
+
+        # Convert the complete source batch before enqueueing anything.  This
+        # preserves the engine's all-or-nothing handoff transaction.
         for pil_frame in pil_frames:
             try:
                 frame_array = np.array(pil_frame.convert('RGB'))
                 if frame_array.shape[:2] != (self.height, self.width):
                     frame_array = cv2.resize(frame_array, (self.width, self.height))
-
-                for _ in range(repeat_per_frame):
-                    self._enqueue_frame_array(frame_array)
-                    processed_count += 1
+                prepared_frames.append(frame_array)
             except Exception as e:
                 print(f"❌ Error processing frame in batch: {e}")
-                continue
-        
+                return 0
+
+        # Distribute repeated frames across the clip rather than holding the
+        # tail for several seconds.  Nearest-neighbour temporal resampling keeps
+        # pixels intact and avoids cross-fade ghost images.
+        source_indices = np.rint(
+            np.linspace(0, len(prepared_frames) - 1, target_frame_count)
+        ).astype(int)
+        for source_index in source_indices:
+            self._enqueue_frame_array(prepared_frames[int(source_index)])
+
         batch_duration = time.time() - batch_start_time
-        batch_fps = processed_count / batch_duration if batch_duration > 0 else 0
-        
-        queue_log.info(f"📺 BATCH COMPLETE: {processed_count} stream frames from {len(pil_frames)} generated frames in {batch_duration:.2f}s ({batch_fps:.1f} fps)")
+        batch_fps = target_frame_count / batch_duration if batch_duration > 0 else 0
+
+        queue_log.info(f"📺 BATCH COMPLETE: {target_frame_count} stream frames from {len(pil_frames)} generated frames in {batch_duration:.2f}s ({batch_fps:.1f} fps)")
         queue_log.info(f"📊 Final queue size: {self.frame_queue.qsize()}/{self.frame_queue.maxsize}")
-        
-        return processed_count
+
+        return len(pil_frames)
+
+    def _monitor_ffmpeg(self):
+        """Read FFmpeg stderr in background so errors are logged."""
+        try:
+            while self.ffmpeg_process and self.ffmpeg_process.stderr:
+                line = self.ffmpeg_process.stderr.readline()
+                if not line:
+                    break
+                decoded = line.decode(errors='replace').strip()
+                if decoded:
+                    queue_log.warning(f"⚠️ FFmpeg: {decoded}")
+        except Exception as e:
+            queue_log.error(f"FFmpeg monitor error: {e}")
+        # Log exit code
+        if self.ffmpeg_process:
+            rc = self.ffmpeg_process.poll()
+            queue_log.error(f"❌ FFmpeg exited with code {rc}")
 
     def _stream_loop(self):
         """Send frames to FFmpeg at consistent FPS - REDUCED LOGGING"""
@@ -586,11 +623,13 @@ class FFmpegRTMPStreamer(Monitorable):
 
     def get_status(self) -> dict:
         """Get current streaming status and performance metrics"""
+        queue_size = self.frame_queue.qsize()
         return {
             "is_streaming": self.is_streaming,
             "frames_sent": self.frames_sent,
             "frames_dropped": self.frames_dropped,
-            "queue_size": self.frame_queue.qsize(),
+            "queue_size": queue_size,
+            "queue_seconds": round(queue_size / max(1.0, float(self.fps)), 1),
             "current_fps": round(self.frames_sent / max(1, time.time() - (self.start_time or time.time())), 1),
             "target_fps": self.fps
         }

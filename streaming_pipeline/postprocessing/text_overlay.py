@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 from typing import Optional, Dict, Any, List
 import time
 from streaming_pipeline.models import Monitorable
@@ -12,10 +12,27 @@ class TextOverlay(Monitorable):
     """
     
     # Common system font search path; first hit wins.
+    # Windows CJK fonts listed FIRST so 中文 / 日文 chat renders correctly on
+    # local (Windows) deployments — DejaVuSans has no CJK glyphs and would
+    # otherwise draw tofu boxes for Han characters.
     _FONT_CANDIDATES = (
-        "/System/Library/Fonts/Arial.ttf",          # macOS
-        "/System/Library/Fonts/Helvetica.ttc",      # macOS fallback
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Debian/Ubuntu (fal runners)
+        # Windows — Traditional Chinese (JhengHei UI Bold, covers Trad + Simp + JP kana)
+        "C:/Windows/Fonts/msjh.ttc",
+        # Windows — Simplified Chinese (YaHei UI, wider coverage)
+        "C:/Windows/Fonts/msyh.ttc",
+        # Windows — MingLiU-ExtB (very wide Han coverage, fallback)
+        "C:/Windows/Fonts/mingliub.ttc",
+        # macOS system CJK (Traditional Chinese)
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        # Linux — Noto Sans CJK (best cross-platform CJK if installed)
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        # macOS Latin fallback
+        "/System/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        # Debian/Ubuntu Latin fallback (no CJK — used only if none above hit)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
     )
@@ -30,6 +47,7 @@ class TextOverlay(Monitorable):
 
         # Current overlay state
         self.current_text = None
+        self.current_kind = None
 
         # Font cache keyed by pixel size so we don't reload TTF on every frame.
         self._font_cache: Dict[int, Any] = {}
@@ -46,21 +64,29 @@ class TextOverlay(Monitorable):
         self.total_processing_time = 0.0
         self.last_batch_size = 0
         self.last_batch_time = 0.0
+        self.last_text_rendered = None
+        self.last_kind_rendered = None
+        self.last_visible_frames = 0
+        self.last_overlay_verified = False
 
     def set_comment(self, comment_text: str, username: str = None):
         """Set comment to overlay on frames"""
         if comment_text:
             self.current_text = f"@{username}: {comment_text}" if username else comment_text
+            self.current_kind = "comment"
         else:
             self.current_text = None
+            self.current_kind = None
         self._invalidate_cache()
 
     def set_prompt(self, prompt_text: str):
         """Set AI prompt to overlay on frames"""
         if prompt_text:
             self.current_text = f"AI: {prompt_text}"
+            self.current_kind = "prompt"
         else:
             self.current_text = None
+            self.current_kind = None
         self._invalidate_cache()
 
     def _invalidate_cache(self):
@@ -220,6 +246,13 @@ class TextOverlay(Monitorable):
     # Fraction of a batch's frames that show the caption (the rest are clean,
     # creating a visual gap before the next caption arrives).
     CAPTION_VISIBLE_RATIO = 0.4
+    # Viewer commands are the interactive part of the show. Keep them on screen
+    # much longer than autonomous AI prompts so a queued Twitch segment cannot
+    # flash the requested comment too briefly to notice.
+    COMMENT_VISIBLE_RATIO = 0.85
+    # Always leave a clean tail. The generator chains from the raw tail, and the
+    # visible stream should also settle back to that clean image before the join.
+    MIN_CLEAN_TAIL_FRAMES = 1
     # Number of frames over which the caption fades out at the end of the
     # visible window.  Keeps the transition smooth instead of a hard cut.
     FADE_OUT_FRAMES = 6
@@ -237,26 +270,46 @@ class TextOverlay(Monitorable):
         start_time = time.time()
 
         n = len(frames)
-        visible_end = max(1, int(n * self.CAPTION_VISIBLE_RATIO))
+        visible_ratio = (
+            self.COMMENT_VISIBLE_RATIO
+            if self.current_kind == "comment"
+            else self.CAPTION_VISIBLE_RATIO
+        )
+        clean_tail = max(self.MIN_CLEAN_TAIL_FRAMES, n // 10)
+        visible_end = max(1, min(n - clean_tail, int(n * visible_ratio)))
         fade_start = max(0, visible_end - self.FADE_OUT_FRAMES)
 
-        for i in range(n):
+        # Never mutate the generator-owned frames. The raw final frame is the
+        # transactional I2V handoff; captions exist only on the RTMP copies.
+        overlaid_frames = list(frames)
+        overlay_verified = False
+
+        for i in range(visible_end):
+            target = frames[i].copy()
             if i < fade_start:
-                self.apply_overlay(frames[i])
-            elif i < visible_end:
+                self.apply_overlay(target)
+            else:
                 # Fade-out region: paste with decreasing alpha.
                 self._apply_overlay_with_alpha(
-                    frames[i],
-                    alpha=1.0 - (i - fade_start) / max(1, visible_end - fade_start),
+                    target,
+                    alpha=(visible_end - 1 - i) / max(1, visible_end - fade_start),
                 )
-            # else: frame stays clean (no overlay)
+            if not overlay_verified:
+                overlay_verified = ImageChops.difference(
+                    frames[i].convert("RGB"), target.convert("RGB")
+                ).getbbox() is not None
+            overlaid_frames[i] = target
 
         self.last_batch_time = time.time() - start_time
         self.last_batch_size = n
         self.total_frames_processed += n
         self.total_processing_time += self.last_batch_time
+        self.last_text_rendered = self.current_text
+        self.last_kind_rendered = self.current_kind
+        self.last_visible_frames = visible_end
+        self.last_overlay_verified = overlay_verified
 
-        return frames
+        return overlaid_frames
 
     def _apply_overlay_with_alpha(self, frame: Image.Image, alpha: float) -> Image.Image:
         """Like apply_overlay but blends the cached bitmap at reduced opacity."""
@@ -288,6 +341,11 @@ class TextOverlay(Monitorable):
         self.last_batch_size = 0
         self.last_batch_time = 0.0
         self.current_text = None  # Clear overlay text too
+        self.current_kind = None
+        self.last_text_rendered = None
+        self.last_kind_rendered = None
+        self.last_visible_frames = 0
+        self.last_overlay_verified = False
         self._invalidate_cache()  # Drop the rendered overlay bitmap as well
         # Keep _font_cache - no need to reload TTF
         print("🧹 Text overlay metrics reset")
@@ -304,5 +362,10 @@ class TextOverlay(Monitorable):
             "last_batch_size": self.last_batch_size,
             "last_batch_time": round(self.last_batch_time, 3),
             "last_batch_avg_per_frame": round(last_avg_time, 4),
-            "has_overlay": self.current_text is not None
+            "has_overlay": self.current_text is not None,
+            "current_kind": self.current_kind,
+            "last_text_rendered": self.last_text_rendered,
+            "last_kind_rendered": self.last_kind_rendered,
+            "last_visible_frames": self.last_visible_frames,
+            "last_overlay_verified": self.last_overlay_verified,
         }

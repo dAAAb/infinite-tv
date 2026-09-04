@@ -5,14 +5,14 @@ from pydantic import BaseModel, Field
 class LTXVideoRequestI2V(BaseModel):
     prompt: str = Field(description="The prompt to generate the video")
     image_base64: str = Field(description="Base64 encoded input image")
-    model_type: Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition"] = Field(default="ltxv1", description="Which model to use for generation")
+    model_type: Literal["ltxv1", "ltx-2.3", "ltx-2.3-local", "ltx-2.3-condition", "h3-max", "ltx25-comfy"] = Field(default="ltx25-comfy", description="Which model to use for generation; ltx25-comfy is local-first")
     negative_prompt: str = Field(
-        default="worst quality, inconsistent motion, blurry, jittery, distorted, static scene, frozen frame, no motion, repetitive, looping",
+        default="frame, border, vignette, letterbox, pillarbox, black bars, white bars, picture-in-picture, screen-within-screen, oversaturated rainbow edges",
         description="The negative prompt",
     )
     # Defaults aligned with StartStreamRequest in api.py.  height/width must
     # be divisible by 32 and num_frames must be 8*k + 1 for LTX.
-    height: int = Field(default=384, description="The height of the video (must be divisible by 32)")
+    height: int = Field(default=288, description="The height of the video (must be divisible by 32)")
     width: int = Field(default=512, description="The width of the video (must be divisible by 32)")
     num_frames: int = Field(default=121, description="The number of frames to generate (must be 8*k + 1)")
     # Drives `duration_s = num_frames / frame_rate` inside the LTX 2.3 pipeline,
@@ -39,7 +39,7 @@ class LTXVideoRequestI2V(BaseModel):
 
     # LTX 2.3-specific parameters
     duration: Optional[Literal[6, 8, 10, 12, 14, 16, 18, 20]] = Field(default=None, description="Duration in seconds (>10s requires 25fps and 1080p)")
-    resolution: Optional[Literal["1080p", "1440p", "2160p"]] = Field(default=None, description="Resolution for LTX 2.3")
+    resolution: Optional[Literal["480p", "768p", "1080p", "1440p", "2160p"]] = Field(default=None, description="Resolution: LTX 2.3 uses 1080p+, H3 Max Turbo uses 480p/768p")
     aspect_ratio: Optional[Literal["auto", "16:9", "9:16"]] = Field(default=None, description="Aspect ratio for LTX 2.3")
 
 class LTXVideoResponseBase64(BaseModel):

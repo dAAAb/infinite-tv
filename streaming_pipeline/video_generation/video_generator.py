@@ -134,6 +134,24 @@ LTX23_WEIGHTS_DIR = os.getenv(
 )
 
 
+def _require_fal_video_opt_in(model_type: str) -> None:
+    """Refuse billable video generation unless it was explicitly enabled.
+
+    A configured ``FAL_KEY`` is only a credential; it must never double as
+    permission to spend money.  Local launches keep ``ENABLE_FAL_VIDEO=false``
+    and cloud models require both an explicit opt-in and a key.
+    """
+    if os.getenv("ENABLE_FAL_VIDEO", "false").lower() != "true":
+        raise RuntimeError(
+            f"{model_type} uses billable fal.ai video generation. "
+            "Set ENABLE_FAL_VIDEO=true explicitly to enable cloud video."
+        )
+    if not os.getenv("FAL_KEY"):
+        raise RuntimeError(
+            f"{model_type} requires FAL_KEY after ENABLE_FAL_VIDEO=true."
+        )
+
+
 # Regular Python class for local use (non-fal.App)
 class RealtimeGenerator(Monitorable):
     
@@ -151,11 +169,7 @@ class RealtimeGenerator(Monitorable):
         self.total_videos = 0
         self.total_generation_time = 0.0
         self.last_generation_time = 0.0
-        
-        # Configure fal client
-        fal_key = os.getenv("FAL_KEY")
-        if fal_key:
-            os.environ["FAL_KEY"] = fal_key
+        self.last_backend = "none"
 
 
     def setup(self):
@@ -223,8 +237,13 @@ class RealtimeGenerator(Monitorable):
         if os.getenv("LTX23_TORCH_COMPILE", "false").lower() == "true":
             try:
                 import triton  # noqa: F401
-                print("⚡ Compiling transformer with torch.compile (reduce-overhead)...")
-                transformer = torch.compile(transformer, mode="reduce-overhead")
+                # Windows/triton note: "reduce-overhead" (cudagraphs) hits a triton-windows
+                # kernel group-file bug (__grp__*.json FileNotFoundError). Default mode ("")
+                # avoids cudagraphs and compiles cleanly. Override via LTX23_COMPILE_MODE.
+                _mode = os.getenv("LTX23_COMPILE_MODE", "default")
+                _kw = {} if _mode in ("", "default") else {"mode": _mode}
+                print(f"⚡ Compiling transformer with torch.compile (mode={_mode})...")
+                transformer = torch.compile(transformer, **_kw)
                 print("⚡ torch.compile applied!")
             except ImportError:
                 print("⚠️ torch.compile skipped: triton not available")
@@ -362,6 +381,7 @@ class RealtimeGenerator(Monitorable):
     
     def generate_video_with_fal_api(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate video using fal.ai LTX 2.3 Fast API"""
+        _require_fal_video_opt_in("ltx-2.3")
         import time
         import traceback
         import fal_client
@@ -444,13 +464,117 @@ class RealtimeGenerator(Monitorable):
     
     def generate_video_from_image(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Main entry point - routes to appropriate backend based on model_type"""
+        self.last_backend = (
+            f"fal.ai:{request.model_type}"
+            if request.model_type in {"ltx-2.3", "h3-max"}
+            else f"local:{request.model_type}"
+        )
         if request.model_type == "ltx-2.3":
             return self.generate_video_with_fal_api(request)
         if request.model_type == "ltx-2.3-condition":
             return self.generate_video_with_condition_pipeline(request)
         if request.model_type == "ltx-2.3-local":
             return self.generate_video_with_local_v23(request)
+        if request.model_type == "h3-max":
+            return self.generate_video_with_h3_max(request)
+        if request.model_type == "ltx25-comfy":
+            return self.generate_video_with_comfy_ltx25(request)
         return self.generate_video_with_local_pipeline(request)
+
+    def generate_video_with_comfy_ltx25(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
+        """Generate via the local ComfyUI LTX-2.5 NVFP4 server.
+
+        Every clip with an input frame uses I2V. The caller transactionally advances
+        that input only after the previous clip passed validation and was accepted by
+        the streamer, so silently falling back to T2V would break continuity.
+        """
+        import time
+
+        from streaming_pipeline.video_generation import comfy_ltx25_backend as comfy
+        mode = "i2v" if request.image_base64 else "t2v"
+        print(f"🔗 ltx25-comfy: explicit {mode.upper()} mode")
+        start_time = time.monotonic()
+        frames, audio_pcm = comfy.generate(
+            prompt=request.prompt,
+            image_base64=request.image_base64,
+            width=request.width,
+            height=request.height,
+            num_frames=request.num_frames,
+            frame_rate=float(request.frame_rate),
+            seed=request.seed,
+            negative=request.negative_prompt,
+            strength=float(request.strength),
+            # Twitch uses the RTMP BGM mixer. Avoid building an unused LTX audio
+            # latent, which adds latency and another temporal boundary.
+            want_audio=False,
+            mode=mode,
+        )
+        self.last_generation_time = time.monotonic() - start_time
+        self.total_generation_time += self.last_generation_time
+        self.total_videos += 1
+        print(
+            f"✅ Local ComfyUI LTX 2.5 generation in "
+            f"{self.last_generation_time:.2f}s"
+        )
+        return LTXVideoResponseWithFrames(frames=frames, audio_pcm=audio_pcm)
+
+    def generate_video_with_h3_max(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
+        """Generate video using fal.ai MiniMax H3 Max Turbo endpoint (cloud).
+
+        H3 Max Turbo is fal's fastest variant — 2x speed of H3 Max at half price.
+        Endpoint: minimax/h3-max-turbo/image-to-video. Pricing (as of Sept 2026):
+        - Promo (until 2026-09-07): $0.00625/s @ 480p, $0.01/s @ 768p
+        - Regular:                  $0.025/s   @ 480p, $0.04/s @ 768p
+        """
+        _require_fal_video_opt_in("h3-max")
+
+        import time
+        import base64
+        import traceback
+        import fal_client
+        start_time = time.time()
+        try:
+            # Prepare image data as data URI
+            image_data = request.image_base64
+            if not image_data.startswith('data:image'):
+                image_data = f"data:image/jpeg;base64,{image_data}"
+
+            fal_input = {
+                "image_url": image_data,
+                "prompt": request.prompt,
+            }
+            if request.duration:
+                fal_input["duration"] = int(request.duration)
+            if request.resolution:
+                # H3 Max Turbo API expects uppercase '480P' / '768P'
+                fal_input["resolution"] = str(request.resolution).upper()
+
+            print(f"🚀 Calling fal.ai H3 Max Turbo API...")
+            print(f"🔑 FAL_KEY set: {bool(os.getenv('FAL_KEY'))}")
+            print(f"   - prompt: {fal_input['prompt'][:50]}...")
+            print(f"   - resolution: {fal_input.get('resolution', '768p')}")
+            print(f"   - duration: {fal_input.get('duration', 5)}s")
+
+            result = fal_client.subscribe(
+                "minimax/h3-max-turbo/image-to-video",
+                arguments=fal_input,
+                with_logs=True,
+            )
+            print(f"✅ H3 Max Turbo completed! keys={list(result.keys())}")
+
+            video_url = result["video"]["url"]
+            frames = self.download_video_frames(video_url, request.width, request.height)
+
+            self.last_generation_time = time.time() - start_time
+            self.total_generation_time += self.last_generation_time
+            self.total_videos += 1
+            print(f"✅ H3 Max Turbo generation in {self.last_generation_time:.2f}s!")
+
+            return LTXVideoResponseWithFrames(frames=frames)
+        except Exception as e:
+            print(f"❌ H3 Max Turbo generation failed: {e}")
+            traceback.print_exc()
+            raise
 
     def generate_video_with_condition_pipeline(self, request: LTXVideoRequestI2V) -> LTXVideoResponseWithFrames:
         """Generate video using LTX2ConditionPipeline with multi-character reference anchoring."""
@@ -712,6 +836,7 @@ class RealtimeGenerator(Monitorable):
         self.total_videos = 0
         self.total_generation_time = 0.0
         self.last_generation_time = 0.0
+        self.last_backend = "none"
         print("🧹 Video generation metrics reset")
     
     def get_status(self) -> Dict[str, Any]:
@@ -721,7 +846,13 @@ class RealtimeGenerator(Monitorable):
             "videos_generated": self.total_videos,
             "avg_generation_time": round(avg_generation_time, 2),
             "last_generation_time": round(self.last_generation_time, 2),
-            "ready": self.pipeline is not None or self.pipeline_v23 is not None
+            "backend": self.last_backend,
+            "uses_cloud_video": self.last_backend.startswith("fal.ai:"),
+            "ready": (
+                self.pipeline is not None
+                or self.pipeline_v23 is not None
+                or self.last_backend == "local:ltx25-comfy"
+            ),
         }
 
 

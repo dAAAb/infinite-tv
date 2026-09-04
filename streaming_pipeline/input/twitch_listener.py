@@ -63,8 +63,8 @@ class TwitchChatListener(Monitorable):
         sock.connect(('irc.chat.twitch.tv', 6667))
         
         # Anonymous connection - no authentication needed
-        sock.send(f"NICK justinfan{int(time.time())}\n".encode('utf-8'))  # Random anonymous nick
-        sock.send(f"JOIN #{self.channel_name}\n".encode('utf-8'))
+        sock.send(f"NICK justinfan{int(time.time())}\r\n".encode('utf-8'))  # Random anonymous nick
+        sock.send(f"JOIN #{self.channel_name}\r\n".encode('utf-8'))
         
         buffer = ""
         
@@ -80,7 +80,7 @@ class TwitchChatListener(Monitorable):
                     # Respond to PING to keep connection alive
                     if stripped.startswith('PING'):
                         pong_reply = stripped.replace('PING', 'PONG', 1)
-                        sock.send(f"{pong_reply}\n".encode('utf-8'))
+                        sock.send(f"{pong_reply}\r\n".encode('utf-8'))
                         continue
                     self._process_message(stripped)
                     
@@ -116,7 +116,7 @@ class TwitchChatListener(Monitorable):
             # Add to queue
             if not self.comment_queue.full():
                 self.comment_queue.put(comment)
-                # print(f"[{user_part}]: {chat_message}")  # Comment this out
+                print(f"💬 TWITCH [{user_part}]: {chat_message}")
                 
         except Exception as e:
             print(f"Error processing message: {e}")

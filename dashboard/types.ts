@@ -167,5 +167,23 @@ export interface LTX23ConditionConfig extends LTX23BaseConfig {
   character_refs: CharacterRef[]
 }
 
-export type ModelType = 'ltxv1' | 'ltx-2.3' | 'ltx-2.3-local' | 'ltx-2.3-condition'
-export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig | LTX23ConditionConfig
+// H3 Max Turbo (fal.ai cloud) — minimax/h3-max-turbo/image-to-video
+// Fastest fal variant: 2x speed of H3 Max at half price.
+// Promo (until 2026-09-07): $0.00625/s @480p, $0.01/s @768p
+// Regular:                  $0.025/s   @480p, $0.04/s @768p
+export interface H3MaxConfig {
+  model: 'h3-max'
+  image_url: string
+  prompt: string
+  // H3 Max Turbo supports 480p and 768p
+  resolution?: '480p' | '768p'
+  // Duration in seconds (H3 Max Turbo default ~5s)
+  duration?: 5 | 10 | 15
+  // Streaming parameters (applied after generation)
+  target_fps?: number
+  width?: number
+  height?: number
+}
+
+export type ModelType = 'ltxv1' | 'ltx-2.3' | 'ltx-2.3-local' | 'ltx-2.3-condition' | 'h3-max'
+export type TestConfig = LTXv1Config | LTXv2Config | LTX23LocalConfig | LTX23ConditionConfig | H3MaxConfig
